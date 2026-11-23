@@ -240,7 +240,15 @@ class UsbSerialManager(private val context: Context) {
 
     fun endExclusiveAccess(resumeMonitoring: Boolean) {
         exclusiveAccess = false
-        if (resumeMonitoring && !monitoring) startMonitoring(lastMonitorBaud)
+        // The flash leaves the bridge at its upload rate; the monitor expects its own so the
+        // first lines after a flash are not garbled (and so the next connect starts at 115200).
+        val restoreBaud = lastMonitorBaud
+        val current = transport
+        if (current != null && restoreBaud != null && restoreBaud > 0 && current.baudRate != restoreBaud) {
+            runCatching { current.setBaudRate(restoreBaud) }
+                .onSuccess { _state.value = ConnectionState.Connected(current.deviceLabel, restoreBaud) }
+        }
+        if (resumeMonitoring && !monitoring) startMonitoring(restoreBaud)
     }
 
     private fun describe(device: UsbDevice, driver: UsbSerialDriver?): String {

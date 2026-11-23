@@ -166,7 +166,10 @@ class FlasherViewModel(
 
     fun connect(entry: UsbSerialManager.DeviceEntry) {
         viewModelScope.launch {
-            val baudRate = settings?.flashBaudRate ?: AppSettings.DEFAULT_FLASH_BAUD
+            // Open at the ROM's sync rate: the monitor runs at it too, and the engine raises the
+            // link to the flash rate only after the bootloader answered.
+            val flashBaudRate = settings?.flashBaudRate ?: AppSettings.DEFAULT_FLASH_BAUD
+            val openBaudRate = EspFlasherEngine.INITIAL_SYNC_BAUD
             appendLog("USB アクセス権を要求しています: ${entry.label}")
             val granted = container.usbManager.requestPermission(entry.device)
             if (!granted) {
@@ -175,10 +178,13 @@ class FlasherViewModel(
                 return@launch
             }
             val result = withContext(Dispatchers.IO) {
-                container.usbManager.open(entry.device, baudRate)
+                container.usbManager.open(entry.device, openBaudRate)
             }
             result.onSuccess {
-                appendLog("接続しました: ${it.deviceLabel} ($baudRate bps)", LogLevel.SUCCESS)
+                appendLog(
+                    "接続しました: ${it.deviceLabel} ($openBaudRate bps で接続 / 書き込み時は $flashBaudRate bps)",
+                    LogLevel.SUCCESS,
+                )
             }.onFailure {
                 appendLog("接続に失敗しました: ${it.message}", LogLevel.ERROR)
                 postMessage(it.message ?: "接続に失敗しました")
@@ -380,6 +386,7 @@ class FlasherViewModel(
         val config = FlashConfig(
             compression = settings?.compression ?: true,
             autoReset = settings?.autoReset ?: true,
+            targetBaudRate = settings?.flashBaudRate ?: AppSettings.DEFAULT_FLASH_BAUD,
         )
         cancelRequested = false
         _state.update {

@@ -61,6 +61,8 @@ data class FlashConfig(
     val blockTimeoutMs: Int = 5_000,
     val eraseTimeoutMs: Int = 30_000,
     val resetAfterFlash: Boolean = true,
+    /** Rate the link is raised to after a successful sync; the ROM always syncs at 115200. */
+    val targetBaudRate: Int = EspFlasherEngine.DEFAULT_TARGET_BAUD_RATE,
 )
 
 sealed class FlashOutcome {
@@ -106,9 +108,17 @@ class EspFlasherEngine(
     var isSynced: Boolean = false
         private set
 
-    /** Runs the boot sequence (when enabled) and synchronises with the ROM bootloader. */
+    /**
+     * Runs the boot sequence (when enabled) and synchronises with the ROM bootloader.
+     *
+     * The ROM only listens at [INITIAL_SYNC_BAUD], whatever rate the port was opened at, so the
+     * link is put back to that rate before DTR/RTS, SYNC and the chip reads. Only once the chip
+     * has answered is the link raised to [FlashConfig.targetBaudRate] through CHANGE_BAUDRATE;
+     * when the USB-UART bridge cannot follow, the flash simply continues at 115200.
+     */
     fun connect(): ChipInfo {
         listener.onStage(FlashStage.CONNECTING)
+        switchToInitialBaudRate()
         if (config.autoReset) {
             performBootloaderReset()
         }
@@ -117,6 +127,7 @@ class EspFlasherEngine(
         chipInfo = info
         isSynced = true
         listener.onLog("接続しました: ${info.displayName}")
+        switchToTargetBaudRate()
         return info
     }
 
@@ -201,7 +212,7 @@ class EspFlasherEngine(
      * restores the previous rate) when the bridge cannot follow.
      */
     fun changeBaudRate(newBaud: Int, currentBaud: Int = link.baudRate): Boolean {
-        if (newBaud == currentBaud) return true
+        if (newBaud <= 0 || newBaud == currentBaud) return true
         return try {
             val response = commandFrame(
                 EspCommands.CHANGE_BAUDRATE,
@@ -242,8 +253,34 @@ class EspFlasherEngine(
         sleep(RESET_SETTLE_MS)
     }
 
+    /**
+     * Puts the link back to [INITIAL_SYNC_BAUD] before a sync. After a flash the link may still
+     * be at the fast rate, and a failed CHANGE_BAUDRATE may leave the bridge anywhere, so this
+     * runs before every SYNC burst instead of only once.
+     */
+    private fun switchToInitialBaudRate() {
+        if (link.baudRate == INITIAL_SYNC_BAUD) return
+        listener.onLog(
+            "SYNC は ${INITIAL_SYNC_BAUD} bps で行うため、ボーレートを ${link.baudRate} bps から戻します",
+        )
+        runCatching { link.setBaudRate(INITIAL_SYNC_BAUD) }
+        decoder.reset()
+        pendingFrames.clear()
+        runCatching { link.flushInput() }
+    }
+
+    private fun switchToTargetBaudRate() {
+        val target = config.targetBaudRate
+        if (target <= 0 || target == INITIAL_SYNC_BAUD) return
+        if (link.baudRate == target) return
+        if (!changeBaudRate(target, INITIAL_SYNC_BAUD)) {
+            listener.onLog("${INITIAL_SYNC_BAUD} bps のまま書き込みを続けます")
+        }
+    }
+
     private fun sync() {
         listener.onStage(FlashStage.SYNCING)
+        switchToInitialBaudRate()
         for (attempt in 1..config.syncAttempts) {
             checkCancelled()
             if (attempt > 1 && attempt % 3 == 0 && config.autoReset) {
@@ -452,6 +489,8 @@ class EspFlasherEngine(
         if (config.autoReset) performBootloaderReset()
         sync()
         isSynced = true
+        // sync() dropped back to 115200; raise the link again so the retry keeps the fast rate.
+        switchToTargetBaudRate()
     }
 
     private fun checkCancelled() {
@@ -468,6 +507,12 @@ class EspFlasherEngine(
         const val CHIP_MAGIC_REGISTER = 0x40001000L
         const val MAC_LOW_REGISTER = 0x3FF5A004L
         const val MAC_HIGH_REGISTER = 0x3FF5A008L
+
+        /** Rate the ROM bootloader always answers SYNC at. */
+        const val INITIAL_SYNC_BAUD = 115_200
+
+        /** Upload rate the app aims for once the bootloader has answered. */
+        const val DEFAULT_TARGET_BAUD_RATE = 460_800
 
         private const val NANOS_PER_MILLI = 1_000_000L
         private const val NANOS_PER_SECOND = 1_000_000_000L

@@ -36,12 +36,17 @@ class EspFlasherEngineTest {
         private val emitNoiseBeforeReplies: Boolean = false,
         private val rejectDataCommands: Boolean = false,
         private val alwaysSilent: Boolean = false,
+        private val rejectBaudChange: Boolean = false,
+        initialBaudRate: Int = 115_200,
     ) : SerialLink {
-        override var baudRate: Int = 115_200
+        override var baudRate: Int = initialBaudRate
             private set
 
         val dtrRtsLog = mutableListOf<Pair<Boolean, Boolean>>()
         val commands = mutableListOf<Request>()
+
+        /** Link rate the USB bridge had when each entry of [commands] arrived. */
+        val baudAtCommand = mutableListOf<Int>()
         val flashPayload = ByteArrayOutputStream()
         var lastFlashBegin: Request? = null
         var lastFlashEnd: Request? = null
@@ -87,6 +92,7 @@ class EspFlasherEngineTest {
             val payload = frame.copyOfRange(8, 8 + size)
             val request = Request(op, checksum, payload)
             commands += request
+            baudAtCommand += baudRate
             if (alwaysSilent) return
             when (op) {
                 EspCommands.SYNC -> {
@@ -105,6 +111,14 @@ class EspFlasherEngineTest {
                 EspCommands.SPI_ATTACH, EspCommands.SPI_SET_PARAMS -> {
                     noise(op)
                     respond(op)
+                }
+
+                EspCommands.CHANGE_BAUDRATE -> {
+                    if (rejectBaudChange) {
+                        respond(op, status = 1, errorCode = 8)
+                    } else {
+                        respond(op)
+                    }
                 }
 
                 EspCommands.FLASH_BEGIN -> {
@@ -338,6 +352,13 @@ class EspFlasherEngineTest {
         assertTrue(device.commands.any { it.op == EspCommands.FLASH_BEGIN })
         assertEquals(EspCommands.FLASH_END, device.lastFlashEnd?.op)
         assertArrayEquals(padded(image, 0x10000), device.flashPayload.toByteArray())
+
+        // The retry re-syncs, so the link has to drop back to the ROM's sync rate first.
+        val syncIndices = device.commands.withIndex()
+            .filter { it.value.op == EspCommands.SYNC }
+            .map { it.index }
+        assertEquals(2, syncIndices.size)
+        assertEquals(115_200, device.baudAtCommand[syncIndices[1]])
     }
 
     @Test
@@ -408,6 +429,79 @@ class EspFlasherEngineTest {
         engine.hardReset()
         assertEquals(listOf(false to true, false to false), device.dtrRtsLog)
         assertFalse(engine.isSynced)
+    }
+
+    @Test
+    fun `a port opened at the flash rate syncs at 115200 and then raises the baud rate`() {
+        val device = FakeEspDevice(initialBaudRate = 460_800)
+        val config = FlashConfig(
+            autoReset = false,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+        )
+        val chip = engine(device, config).connect()
+        assertEquals("ESP32", chip.name)
+
+        val syncIndex = device.commands.indexOfFirst { it.op == EspCommands.SYNC }
+        assertTrue("no SYNC was sent", syncIndex >= 0)
+        assertEquals(115_200, device.baudAtCommand[syncIndex])
+
+        // The chip reads happen at the safe rate too, so a slow bridge still reports the chip.
+        val chipReadIndex = device.commands.indexOfFirst { it.op == EspCommands.READ_REG }
+        assertEquals(115_200, device.baudAtCommand[chipReadIndex])
+
+        val changeIndex = device.commands.indexOfFirst { it.op == EspCommands.CHANGE_BAUDRATE }
+        assertTrue("CHANGE_BAUDRATE was not sent", changeIndex > chipReadIndex)
+        assertEquals(460_800L, device.commands[changeIndex].u32(0))
+        assertEquals(115_200L, device.commands[changeIndex].u32(4))
+        assertEquals(460_800, device.baudRate)
+    }
+
+    @Test
+    fun `flash from a port opened at 460800 writes at the raised rate`() {
+        val device = FakeEspDevice(initialBaudRate = 460_800)
+        val config = FlashConfig(
+            autoReset = false,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+        )
+        val outcome = engine(device, config).flash(ByteArray(2_048) { 1 }, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+
+        val syncIndex = device.commands.indexOfFirst { it.op == EspCommands.SYNC }
+        assertEquals(115_200, device.baudAtCommand[syncIndex])
+        val dataIndex = device.commands.indexOfFirst { it.op == EspCommands.FLASH_DEFL_DATA }
+        assertTrue("no flash data was sent", dataIndex > syncIndex)
+        assertEquals(460_800, device.baudAtCommand[dataIndex])
+    }
+
+    @Test
+    fun `no baud change is sent when the configured rate is the sync rate`() {
+        val device = FakeEspDevice(initialBaudRate = 460_800)
+        val config = FlashConfig(
+            autoReset = false,
+            resetAfterFlash = false,
+            targetBaudRate = 115_200,
+        )
+        engine(device, config).connect()
+        assertTrue(device.commands.none { it.op == EspCommands.CHANGE_BAUDRATE })
+        assertEquals(115_200, device.baudRate)
+    }
+
+    @Test
+    fun `a rejected baud change keeps 115200 and the flash still succeeds`() {
+        val device = FakeEspDevice(initialBaudRate = 460_800, rejectBaudChange = true)
+        val config = FlashConfig(
+            autoReset = false,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+        )
+        val outcome = engine(device, config).flash(ByteArray(1_024) { 2 }, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+        assertTrue(device.commands.any { it.op == EspCommands.CHANGE_BAUDRATE })
+        assertEquals(115_200, device.baudRate)
+        val dataIndex = device.commands.indexOfFirst { it.op == EspCommands.FLASH_DEFL_DATA }
+        assertEquals(115_200, device.baudAtCommand[dataIndex])
     }
 
     @Test
