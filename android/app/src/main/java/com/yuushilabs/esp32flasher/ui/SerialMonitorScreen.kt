@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -100,7 +99,6 @@ fun SerialMonitorScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .imePadding()
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -464,8 +462,10 @@ private fun MonitorInputBar(
 }
 
 private fun connectionText(state: MonitorUiState): String = when (val connection = state.connection) {
+    // The connection holds the rate the bridge actually runs at, which differs from the selected
+    // rate while a change is failing; the baud button keeps showing the selection.
     is UsbSerialManager.ConnectionState.Connected ->
-        "${connection.deviceLabel} · ${state.baudRate} bps"
+        "${connection.deviceLabel} · ${connection.baudRate} bps"
 
     is UsbSerialManager.ConnectionState.Error -> connection.message
     UsbSerialManager.ConnectionState.Disconnected -> "USB デバイス未接続（書き込みタブで接続）"

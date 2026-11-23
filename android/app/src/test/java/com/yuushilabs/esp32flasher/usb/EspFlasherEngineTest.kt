@@ -6,6 +6,7 @@ import com.yuushilabs.esp32flasher.core.EspProtocolException
 import com.yuushilabs.esp32flasher.core.SlipCodec
 import com.yuushilabs.esp32flasher.core.SlipDecoder
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.util.zip.Inflater
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -37,6 +38,9 @@ class EspFlasherEngineTest {
         private val rejectDataCommands: Boolean = false,
         private val alwaysSilent: Boolean = false,
         private val rejectBaudChange: Boolean = false,
+        private val ignoreBaudChange: Boolean = false,
+        private val failSwitchToBaud: Int? = null,
+        private val silentAtBaud: Int? = null,
         initialBaudRate: Int = 115_200,
     ) : SerialLink {
         override var baudRate: Int = initialBaudRate
@@ -57,6 +61,8 @@ class EspFlasherEngineTest {
         private val pending = ArrayDeque<Byte>()
 
         override fun write(data: ByteArray) {
+            // A ROM that switched its UART but never answers there again.
+            if (silentAtBaud != null && baudRate == silentAtBaud) return
             decoder.feed(data).forEach(::handleFrame)
         }
 
@@ -73,6 +79,8 @@ class EspFlasherEngineTest {
         }
 
         override fun setBaudRate(baudRate: Int) {
+            // A USB-UART bridge that accepts the ROM's switch but cannot follow it.
+            if (baudRate == failSwitchToBaud) throw IOException("bridge cannot switch to $baudRate")
             this.baudRate = baudRate
         }
 
@@ -114,10 +122,11 @@ class EspFlasherEngineTest {
                 }
 
                 EspCommands.CHANGE_BAUDRATE -> {
-                    if (rejectBaudChange) {
-                        respond(op, status = 1, errorCode = 8)
-                    } else {
-                        respond(op)
+                    when {
+                        // The ROM ignores the request but keeps answering at the old rate.
+                        ignoreBaudChange -> Unit
+                        rejectBaudChange -> respond(op, status = 1, errorCode = 8)
+                        else -> respond(op)
                     }
                 }
 
@@ -517,8 +526,53 @@ class EspFlasherEngineTest {
     }
 
     @Test
-    fun `baud rate change keeps the old rate when the device stays silent`() {
-        val device = FakeEspDevice(alwaysSilent = true)
+    fun `baud rate change keeps the old rate when the bootloader ignores it`() {
+        val device = FakeEspDevice(ignoreBaudChange = true)
+        val engine = engine(device, FlashConfig(autoReset = false, responseTimeoutMs = 10))
+        assertFalse(engine.changeBaudRate(460_800, 115_200))
+        assertEquals(115_200, device.baudRate)
+    }
+
+    @Test
+    fun `a bridge that cannot switch after the rom accepted is recovered by a reset and resync`() {
+        val device = FakeEspDevice(failSwitchToBaud = 460_800)
+        val config = FlashConfig(
+            autoReset = true,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+        )
+        val outcome = engine(device, config).flash(ByteArray(1_024) { 3 }, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+        assertEquals(115_200, device.baudRate)
+
+        // connect's reset, the recovery reset, then the write at the safe rate.
+        assertEquals(2, device.dtrRtsLog.size / 3)
+        assertEquals(2, device.commands.count { it.op == EspCommands.SYNC })
+        val dataIndex = device.commands.indexOfFirst { it.op == EspCommands.FLASH_DEFL_DATA }
+        assertEquals(115_200, device.baudAtCommand[dataIndex])
+    }
+
+    @Test
+    fun `a rom that goes silent at the new rate is recovered by a reset`() {
+        val device = FakeEspDevice(silentAtBaud = 921_600)
+        val config = FlashConfig(
+            autoReset = true,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+            responseTimeoutMs = 50,
+        )
+        val engine = engine(device, config)
+        engine.connect()
+        assertEquals(460_800, device.baudRate)
+
+        assertFalse(engine.changeBaudRate(921_600, 460_800))
+        assertEquals(115_200, device.baudRate)
+        assertTrue(engine.isSynced)
+    }
+
+    @Test
+    fun `a baud rate change the bootloader refuses keeps 115200`() {
+        val device = FakeEspDevice(rejectBaudChange = true)
         val engine = engine(device, FlashConfig(autoReset = false, responseTimeoutMs = 10))
         assertFalse(engine.changeBaudRate(460_800, 115_200))
         assertEquals(115_200, device.baudRate)

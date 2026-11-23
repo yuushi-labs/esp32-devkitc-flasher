@@ -208,22 +208,52 @@ class EspFlasherEngine(
     }
 
     /**
-     * Switches the ROM bootloader and the USB-UART bridge to [newBaud]. Returns false (and
-     * restores the previous rate) when the bridge cannot follow.
+     * Switches the ROM bootloader and the USB-UART bridge to [newBaud].
+     *
+     * Returns false when the change could not be made, after putting both sides back on
+     * [currentBaud]: a rejected request leaves the ROM where it was, and a bridge that accepts
+     * nothing at the new rate is recovered by a bootloader reset (the ROM boots at 115200 again).
+     * Throws [EspProtocolException] when that recovery cannot re-establish the link.
      */
     fun changeBaudRate(newBaud: Int, currentBaud: Int = link.baudRate): Boolean {
         if (newBaud <= 0 || newBaud == currentBaud) return true
-        return try {
+
+        val accepted = try {
             val response = commandFrame(
                 EspCommands.CHANGE_BAUDRATE,
                 EspBootloaderProtocol.changeBaudFrame(newBaud, currentBaud),
                 config.responseTimeoutMs,
             )
             requireOk(EspCommands.CHANGE_BAUDRATE, response)
-            sleep(BAUD_SWITCH_DELAY_MS)
-            link.setBaudRate(newBaud)
-            decoder.reset()
-            pendingFrames.clear()
+            true
+        } catch (cancelled: FlashCancelledException) {
+            throw cancelled
+        } catch (error: Exception) {
+            listener.onLog("ボーレート変更に失敗しました: ${error.message}")
+            false
+        }
+
+        if (!accepted) {
+            // A refusal keeps the ROM at the old rate. A lost reply is ambiguous - the ROM may
+            // already have switched - so the link is checked at the old rate before continuing.
+            if (!isBootloaderReachableAt(currentBaud)) {
+                listener.onLog("ESP32 が応答しません。ボーレートがずれたためリセットして復旧します")
+                recoverAtSyncRate(currentBaud)
+            }
+            return false
+        }
+
+        sleep(BAUD_SWITCH_DELAY_MS)
+        val switched = runCatching { link.setBaudRate(newBaud) }.isSuccess
+        decoder.reset()
+        pendingFrames.clear()
+        if (!switched) {
+            // The ROM is at newBaud while the bridge still is not: only a reset brings them back.
+            listener.onLog("USB 側を $newBaud bps に切り替えられませんでした。ESP32 をリセットして復旧します")
+            recoverAtSyncRate(currentBaud)
+            return false
+        }
+        return try {
             val magic = commandFrame(
                 EspCommands.READ_REG,
                 EspBootloaderProtocol.readRegFrame(CHIP_MAGIC_REGISTER),
@@ -231,11 +261,55 @@ class EspFlasherEngine(
             )
             listener.onLog("ボーレートを $newBaud bps に変更しました (magic=0x%08X)".format(magic.value))
             true
+        } catch (cancelled: FlashCancelledException) {
+            throw cancelled
         } catch (error: Exception) {
-            listener.onLog("ボーレート変更に失敗しました: ${error.message}")
-            runCatching { link.setBaudRate(currentBaud) }
+            listener.onLog("$newBaud bps で応答がありません: ${error.message}")
+            recoverAtSyncRate(currentBaud)
             false
         }
+    }
+
+    /** True when the ROM bootloader answers a register read at [baudRate]. */
+    private fun isBootloaderReachableAt(baudRate: Int): Boolean {
+        runCatching { link.setBaudRate(baudRate) }
+        decoder.reset()
+        pendingFrames.clear()
+        runCatching { link.flushInput() }
+        return try {
+            commandFrame(
+                EspCommands.READ_REG,
+                EspBootloaderProtocol.readRegFrame(CHIP_MAGIC_REGISTER),
+                config.responseTimeoutMs,
+            )
+            true
+        } catch (cancelled: FlashCancelledException) {
+            throw cancelled
+        } catch (error: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Puts the ROM and the bridge back in step after a baud-rate change went wrong. A bootloader
+     * reset returns the ROM's UART to 115200, so both sides meet there again; without the auto
+     * reset the caller has to reset the board by hand and [sync] reports it.
+     */
+    private fun recoverAtSyncRate(fallbackBaud: Int) {
+        runCatching { link.setBaudRate(fallbackBaud) }
+        decoder.reset()
+        pendingFrames.clear()
+        isSynced = false
+        if (config.autoReset) {
+            listener.onLog("ESP32 をリセットして ${INITIAL_SYNC_BAUD} bps で再同期します")
+            performBootloaderReset()
+        }
+        try {
+            sync()
+        } catch (error: EspProtocolException) {
+            throw EspProtocolException("ボーレート変更後の復旧に失敗しました: ${error.message}")
+        }
+        isSynced = true
     }
 
     fun performBootloaderReset() {
