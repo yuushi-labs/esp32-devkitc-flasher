@@ -1,0 +1,447 @@
+package com.yuushilabs.esp32flasher.usb
+
+import com.yuushilabs.esp32flasher.core.EspBootloaderProtocol
+import com.yuushilabs.esp32flasher.core.EspCommands
+import com.yuushilabs.esp32flasher.core.EspProtocolException
+import com.yuushilabs.esp32flasher.core.EspResponse
+import com.yuushilabs.esp32flasher.core.FlashPlan
+import com.yuushilabs.esp32flasher.core.HexAddressParser
+import com.yuushilabs.esp32flasher.core.SlipDecoder
+
+/** Phases reported while connecting and flashing, used by the UI progress panel. */
+enum class FlashStage {
+    CONNECTING,
+    SYNCING,
+    CHIP_INFO,
+    ATTACHING,
+    ERASING,
+    WRITING,
+    FINISHING,
+    RESETTING,
+    DONE,
+}
+
+data class ChipInfo(
+    val name: String,
+    val macAddress: String? = null,
+) {
+    val displayName: String
+        get() = if (macAddress != null) "$name ($macAddress)" else name
+}
+
+data class FlashProgress(
+    val bytesWritten: Long,
+    val totalBytes: Long,
+    val bytesPerSecond: Long,
+) {
+    val percent: Int
+        get() = if (totalBytes <= 0L) 0 else ((bytesWritten * 100) / totalBytes).toInt().coerceIn(0, 100)
+
+    val kilobytesPerSecond: Int get() = (bytesPerSecond / 1024).toInt()
+}
+
+interface FlashListener {
+    fun onStage(stage: FlashStage) = Unit
+
+    fun onLog(message: String) = Unit
+
+    fun onProgress(progress: FlashProgress) = Unit
+
+    companion object {
+        val NONE: FlashListener = object : FlashListener {}
+    }
+}
+
+data class FlashConfig(
+    val compression: Boolean = true,
+    val autoReset: Boolean = true,
+    val syncAttempts: Int = 7,
+    val syncTimeoutMs: Int = 250,
+    val responseTimeoutMs: Int = 3_000,
+    val blockTimeoutMs: Int = 5_000,
+    val eraseTimeoutMs: Int = 30_000,
+    val resetAfterFlash: Boolean = true,
+)
+
+sealed class FlashOutcome {
+    data class Success(
+        val transferredBytes: Int,
+        val uncompressedBytes: Int,
+        val compressed: Boolean,
+        val elapsedMs: Long,
+        val chip: ChipInfo?,
+    ) : FlashOutcome()
+
+    data class Failure(val message: String, val cause: Throwable? = null) : FlashOutcome()
+
+    data object Cancelled : FlashOutcome()
+}
+
+class EspTimeoutException(message: String) : Exception(message)
+
+class FlashCancelledException : Exception("書き込みを中止しました")
+
+/**
+ * Drives the ESP32 ROM bootloader: DTR/RTS boot sequence, SYNC, SPI_ATTACH and
+ * FLASH_(DEFL_)BEGIN / DATA / END with an uncompressed fallback.
+ *
+ * The class only depends on [SerialLink], so the entire sequence can be verified on the JVM
+ * against a simulated ROM bootloader.
+ */
+class EspFlasherEngine(
+    private val link: SerialLink,
+    private val config: FlashConfig = FlashConfig(),
+    private val listener: FlashListener = FlashListener.NONE,
+    private val clock: () -> Long = { System.nanoTime() },
+    private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
+    private val cancellation: () -> Boolean = { false },
+) {
+    private val decoder = SlipDecoder()
+    private val pendingFrames = ArrayDeque<ByteArray>()
+    private val readBuffer = ByteArray(READ_BUFFER_SIZE)
+
+    var chipInfo: ChipInfo? = null
+        private set
+
+    var isSynced: Boolean = false
+        private set
+
+    /** Runs the boot sequence (when enabled) and synchronises with the ROM bootloader. */
+    fun connect(): ChipInfo {
+        listener.onStage(FlashStage.CONNECTING)
+        if (config.autoReset) {
+            performBootloaderReset()
+        }
+        sync()
+        val info = readChipInfo()
+        chipInfo = info
+        isSynced = true
+        listener.onLog("接続しました: ${info.displayName}")
+        return info
+    }
+
+    /** Writes [image] at [offset]. Never throws for protocol errors; inspect the outcome. */
+    fun flash(image: ByteArray, offset: Long, compression: Boolean = config.compression): FlashOutcome {
+        if (image.isEmpty()) {
+            return FlashOutcome.Failure("書き込むイメージが空です")
+        }
+        val startedAt = clock()
+        return try {
+            if (!isSynced) {
+                connect()
+            }
+            attachFlash()
+
+            var plan = EspBootloaderProtocol.flashPlan(image, offset, compression)
+            var compressed = plan.compressed
+            if (compressed) {
+                try {
+                    writePlan(plan)
+                } catch (error: EspProtocolException) {
+                    listener.onLog("圧縮書き込みに失敗しました (${error.message})。非圧縮で再試行します")
+                    resetProtocolState()
+                    attachFlash()
+                    plan = EspBootloaderProtocol.flashPlan(image, offset, compression = false)
+                    compressed = false
+                    writePlan(plan)
+                }
+            } else {
+                writePlan(plan)
+            }
+
+            if (config.resetAfterFlash) {
+                hardReset()
+            }
+            listener.onStage(FlashStage.DONE)
+            val elapsedMs = (clock() - startedAt) / NANOS_PER_MILLI
+            listener.onLog(
+                "書き込み完了: %d バイト (%s) を %s に書き込みました".format(
+                    plan.uncompressedSize,
+                    if (compressed) "圧縮" else "非圧縮",
+                    HexAddressParser.format(offset),
+                ),
+            )
+            FlashOutcome.Success(
+                transferredBytes = plan.payload.size,
+                uncompressedBytes = plan.uncompressedSize,
+                compressed = compressed,
+                elapsedMs = elapsedMs,
+                chip = chipInfo,
+            )
+        } catch (cancelled: FlashCancelledException) {
+            listener.onLog("書き込みを中止しました")
+            FlashOutcome.Cancelled
+        } catch (error: Exception) {
+            listener.onLog("書き込みに失敗しました: ${error.message}")
+            FlashOutcome.Failure(error.message ?: "書き込みに失敗しました", error)
+        }
+    }
+
+    /** Asserts that the bootloader is reachable without flashing anything. */
+    fun probe(): ChipInfo {
+        val info = if (isSynced) chipInfo ?: readChipInfo() else connect()
+        chipInfo = info
+        isSynced = true
+        return info
+    }
+
+    fun hardReset() {
+        listener.onStage(FlashStage.RESETTING)
+        listener.onLog("ハードリセットを実行します")
+        link.setDtrRts(false, true)
+        sleep(RESET_PULSE_MS)
+        link.setDtrRts(false, false)
+        sleep(RESET_SETTLE_MS)
+        link.flushInput()
+        isSynced = false
+    }
+
+    /**
+     * Switches the ROM bootloader and the USB-UART bridge to [newBaud]. Returns false (and
+     * restores the previous rate) when the bridge cannot follow.
+     */
+    fun changeBaudRate(newBaud: Int, currentBaud: Int = link.baudRate): Boolean {
+        if (newBaud == currentBaud) return true
+        return try {
+            val response = commandFrame(
+                EspCommands.CHANGE_BAUDRATE,
+                EspBootloaderProtocol.changeBaudFrame(newBaud, currentBaud),
+                config.responseTimeoutMs,
+            )
+            requireOk(EspCommands.CHANGE_BAUDRATE, response)
+            sleep(BAUD_SWITCH_DELAY_MS)
+            link.setBaudRate(newBaud)
+            decoder.reset()
+            pendingFrames.clear()
+            val magic = commandFrame(
+                EspCommands.READ_REG,
+                EspBootloaderProtocol.readRegFrame(CHIP_MAGIC_REGISTER),
+                config.responseTimeoutMs,
+            )
+            listener.onLog("ボーレートを $newBaud bps に変更しました (magic=0x%08X)".format(magic.value))
+            true
+        } catch (error: Exception) {
+            listener.onLog("ボーレート変更に失敗しました: ${error.message}")
+            runCatching { link.setBaudRate(currentBaud) }
+            false
+        }
+    }
+
+    fun performBootloaderReset() {
+        listener.onLog("DTR/RTS でブートローダーへ突入します")
+        // esptool classic reset: EN low while IO0 stays high, then IO0 low while EN goes high.
+        link.setDtrRts(false, true)
+        sleep(RESET_PULSE_MS)
+        link.setDtrRts(true, false)
+        sleep(RESET_PULSE_MS)
+        link.setDtrRts(false, false)
+        sleep(RESET_SETTLE_MS)
+        link.flushInput()
+        decoder.reset()
+        pendingFrames.clear()
+        sleep(RESET_SETTLE_MS)
+    }
+
+    private fun sync() {
+        listener.onStage(FlashStage.SYNCING)
+        for (attempt in 1..config.syncAttempts) {
+            checkCancelled()
+            if (attempt > 1 && attempt % 3 == 0 && config.autoReset) {
+                performBootloaderReset()
+            }
+            listener.onLog("SYNC 送信 ($attempt/${config.syncAttempts})")
+            link.write(EspBootloaderProtocol.syncFrame())
+            try {
+                val response = readResponse(config.syncTimeoutMs)
+                if (response.command == EspCommands.SYNC) {
+                    decoder.reset()
+                    pendingFrames.clear()
+                    listener.onLog("SYNC 応答を受信しました")
+                    return
+                }
+            } catch (timeout: EspTimeoutException) {
+                // Retry with the next SYNC packet.
+            }
+        }
+        throw EspProtocolException(
+            "ESP32 と同期できませんでした。BOOT ボタンを押しながらリセットし、もう一度お試しください。",
+        )
+    }
+
+    private fun readChipInfo(): ChipInfo {
+        listener.onStage(FlashStage.CHIP_INFO)
+        val name = try {
+            val response = commandFrame(
+                EspCommands.READ_REG,
+                EspBootloaderProtocol.readRegFrame(CHIP_MAGIC_REGISTER),
+                config.responseTimeoutMs,
+            )
+            EspBootloaderProtocol.detectChip(response.value)
+                ?: "ESP32 (magic 0x%08X)".format(response.value)
+        } catch (error: EspProtocolException) {
+            listener.onLog("チップ種別を取得できませんでした: ${error.message}")
+            "ESP32"
+        }
+        val mac = try {
+            val low = commandFrame(
+                EspCommands.READ_REG,
+                EspBootloaderProtocol.readRegFrame(MAC_LOW_REGISTER),
+                config.responseTimeoutMs,
+            )
+            val high = commandFrame(
+                EspCommands.READ_REG,
+                EspBootloaderProtocol.readRegFrame(MAC_HIGH_REGISTER),
+                config.responseTimeoutMs,
+            )
+            EspBootloaderProtocol.formatMac(high.value, low.value)
+        } catch (error: EspProtocolException) {
+            listener.onLog("MAC アドレスを取得できませんでした: ${error.message}")
+            null
+        }
+        return ChipInfo(name, mac)
+    }
+
+    private fun attachFlash() {
+        listener.onStage(FlashStage.ATTACHING)
+        val response = commandFrame(
+            EspCommands.SPI_ATTACH,
+            EspBootloaderProtocol.spiAttachFrame(),
+            config.responseTimeoutMs,
+        )
+        requireOk(EspCommands.SPI_ATTACH, response)
+        listener.onLog("内蔵 SPI フラッシュを有効化しました")
+    }
+
+    private fun writePlan(plan: FlashPlan) {
+        listener.onStage(FlashStage.ERASING)
+        listener.onLog(
+            "フラッシュを消去して転送を開始します (消去 %d バイト / %d ブロック)".format(
+                plan.eraseSize,
+                plan.numBlocks,
+            ),
+        )
+        val beginOp = if (plan.compressed) EspCommands.FLASH_DEFL_BEGIN else EspCommands.FLASH_BEGIN
+        val begin = commandFrame(
+            beginOp,
+            EspBootloaderProtocol.flashBeginFrame(
+                size = plan.uncompressedSize,
+                numBlocks = plan.numBlocks,
+                blockSize = plan.blockSize,
+                offset = plan.offset,
+                compressed = plan.compressed,
+            ),
+            config.eraseTimeoutMs,
+        )
+        requireOk(beginOp, begin)
+
+        listener.onStage(FlashStage.WRITING)
+        val dataOp = if (plan.compressed) EspCommands.FLASH_DEFL_DATA else EspCommands.FLASH_DATA
+        val startedAt = clock()
+        var written = 0L
+        val chunks = plan.chunks()
+        chunks.forEachIndexed { sequence, chunk ->
+            checkCancelled()
+            val response = commandFrame(
+                dataOp,
+                EspBootloaderProtocol.flashDataFrame(chunk, sequence, plan.compressed),
+                config.blockTimeoutMs,
+            )
+            requireOk(dataOp, response)
+            written += chunk.size
+            val elapsed = (clock() - startedAt).coerceAtLeast(1L)
+            listener.onProgress(
+                FlashProgress(
+                    bytesWritten = written,
+                    totalBytes = plan.payload.size.toLong(),
+                    bytesPerSecond = (written * NANOS_PER_SECOND) / elapsed,
+                ),
+            )
+        }
+
+        listener.onStage(FlashStage.FINISHING)
+        val endOp = if (plan.compressed) EspCommands.FLASH_DEFL_END else EspCommands.FLASH_END
+        val end = commandFrame(
+            endOp,
+            EspBootloaderProtocol.flashEndFrame(stayInLoader = false, compressed = plan.compressed),
+            config.responseTimeoutMs,
+        )
+        requireOk(endOp, end)
+    }
+
+    private fun commandFrame(op: Int, frame: ByteArray, timeoutMs: Int): EspResponse {
+        link.write(frame)
+        var response = readResponse(timeoutMs)
+        var skipped = 0
+        while (response.command != op && skipped < MAX_SKIPPED_FRAMES) {
+            listener.onLog("想定外の応答 (0x%02X) を無視します".format(response.command))
+            response = readResponse(timeoutMs)
+            skipped++
+        }
+        if (response.command != op) {
+            throw EspProtocolException(
+                "応答コマンドが一致しません: 0x%02X (期待 0x%02X)".format(response.command, op),
+            )
+        }
+        return response
+    }
+
+    private fun readResponse(timeoutMs: Int): EspResponse {
+        val deadline = clock() + timeoutMs.toLong() * NANOS_PER_MILLI
+        while (true) {
+            checkCancelled()
+            pendingFrames.removeFirstOrNull()?.let { return EspBootloaderProtocol.parseResponse(it) }
+            val remainingMs = (deadline - clock()) / NANOS_PER_MILLI
+            if (remainingMs <= 0) {
+                throw EspTimeoutException("ESP32 からの応答がタイムアウトしました (${timeoutMs}ms)")
+            }
+            val readTimeout = remainingMs.coerceIn(1L, MAX_READ_TIMEOUT_MS).toInt()
+            val count = link.read(readBuffer, readTimeout)
+            if (count > 0) {
+                decoder.feed(readBuffer, 0, count).forEach { pendingFrames.addLast(it) }
+            }
+        }
+    }
+
+    private fun requireOk(op: Int, response: EspResponse) {
+        if (response.status != 0) {
+            throw EspProtocolException(
+                "コマンド 0x%02X が失敗しました (status=%d)".format(op, response.status),
+            )
+        }
+    }
+
+    private fun resetProtocolState() {
+        decoder.reset()
+        pendingFrames.clear()
+        isSynced = false
+        link.flushInput()
+        if (config.autoReset) performBootloaderReset()
+        sync()
+        isSynced = true
+    }
+
+    private fun checkCancelled() {
+        if (cancellation()) throw FlashCancelledException()
+    }
+
+    private fun sleep(milliseconds: Long) {
+        checkCancelled()
+        sleeper(milliseconds)
+        checkCancelled()
+    }
+
+    companion object {
+        const val CHIP_MAGIC_REGISTER = 0x40001000L
+        const val MAC_LOW_REGISTER = 0x3FF5A004L
+        const val MAC_HIGH_REGISTER = 0x3FF5A008L
+
+        private const val NANOS_PER_MILLI = 1_000_000L
+        private const val NANOS_PER_SECOND = 1_000_000_000L
+        private const val READ_BUFFER_SIZE = 4096
+        private const val MAX_READ_TIMEOUT_MS = 100L
+        private const val MAX_SKIPPED_FRAMES = 4
+        private const val RESET_PULSE_MS = 100L
+        private const val RESET_SETTLE_MS = 50L
+        private const val BAUD_SWITCH_DELAY_MS = 20L
+    }
+}
