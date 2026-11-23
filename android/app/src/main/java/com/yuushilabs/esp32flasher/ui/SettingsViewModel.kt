@@ -11,6 +11,7 @@ import com.yuushilabs.esp32flasher.update.UpdateStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -38,14 +39,31 @@ class SettingsViewModel(
 
     init {
         viewModelScope.launch {
-            container.settingsRepository.settings.collect { settings ->
-                _state.update { current ->
-                    current.copy(
-                        settings = settings,
-                        repositoryInput = if (initialized) current.repositoryInput else settings.repository,
-                    )
+            container.settingsRepository.settings
+                .catch { error ->
+                    _state.update {
+                        it.copy(message = "設定を読み込めませんでした: ${error.message}")
+                    }
                 }
-                initialized = true
+                .collect { settings ->
+                    _state.update { current ->
+                        current.copy(
+                            settings = settings,
+                            repositoryInput = if (initialized) current.repositoryInput else settings.repository,
+                        )
+                    }
+                    initialized = true
+                }
+        }
+    }
+
+    /** Saves a setting and reports a failed write instead of crashing the scope. */
+    private fun persist(block: suspend () -> Unit) {
+        viewModelScope.launch {
+            runCatching { block() }.onFailure { error ->
+                _state.update {
+                    it.copy(message = "設定を保存できませんでした: ${error.message}")
+                }
             }
         }
     }
@@ -62,14 +80,21 @@ class SettingsViewModel(
             return
         }
         viewModelScope.launch {
-            container.settingsRepository.updateRepository(repository.slug)
-            _state.update {
-                it.copy(
-                    repositoryInput = repository.slug,
-                    repositoryError = null,
-                    message = "${repository.slug} を保存しました",
-                )
-            }
+            runCatching { container.settingsRepository.updateRepository(repository.slug) }
+                .onSuccess {
+                    _state.update {
+                        it.copy(
+                            repositoryInput = repository.slug,
+                            repositoryError = null,
+                            message = "${repository.slug} を保存しました",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update {
+                        it.copy(message = "リポジトリを保存できませんでした: ${error.message}")
+                    }
+                }
         }
     }
 
@@ -79,41 +104,48 @@ class SettingsViewModel(
     }
 
     fun clearRepositoryHistory() {
-        viewModelScope.launch { container.settingsRepository.clearHistory() }
+        persist { container.settingsRepository.clearHistory() }
     }
 
     fun setMonitorBaudRate(baudRate: Int) {
-        viewModelScope.launch { container.settingsRepository.setMonitorBaudRate(baudRate) }
+        persist { container.settingsRepository.setMonitorBaudRate(baudRate) }
     }
 
     fun setFlashBaudRate(baudRate: Int) {
-        viewModelScope.launch { container.settingsRepository.setFlashBaudRate(baudRate) }
+        persist { container.settingsRepository.setFlashBaudRate(baudRate) }
     }
 
     fun setCompression(enabled: Boolean) {
-        viewModelScope.launch { container.settingsRepository.setCompression(enabled) }
+        persist { container.settingsRepository.setCompression(enabled) }
     }
 
     fun setAutoReset(enabled: Boolean) {
-        viewModelScope.launch { container.settingsRepository.setAutoReset(enabled) }
+        persist { container.settingsRepository.setAutoReset(enabled) }
     }
 
     fun setCheckUpdatesOnStart(enabled: Boolean) {
-        viewModelScope.launch { container.settingsRepository.setCheckUpdatesOnStart(enabled) }
+        persist { container.settingsRepository.setCheckUpdatesOnStart(enabled) }
     }
 
     fun setMonitorTimestamps(enabled: Boolean) {
-        viewModelScope.launch { container.settingsRepository.setMonitorTimestamps(enabled) }
+        persist { container.settingsRepository.setMonitorTimestamps(enabled) }
     }
 
     fun setGithubToken(token: String) {
-        viewModelScope.launch { container.settingsRepository.setGithubToken(token) }
+        persist { container.settingsRepository.setGithubToken(token) }
     }
 
     fun resetSettings() {
         viewModelScope.launch {
-            container.settingsRepository.resetToDefaults()
-            _state.update { it.copy(message = "設定を初期化しました") }
+            runCatching { container.settingsRepository.resetToDefaults() }
+                .onSuccess {
+                    // Let the next emission refill the repository input with the default repo.
+                    initialized = false
+                    _state.update { it.copy(message = "設定を初期化しました") }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(message = "設定を初期化できませんでした: ${error.message}") }
+                }
         }
     }
 

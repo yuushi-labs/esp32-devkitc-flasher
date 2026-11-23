@@ -62,15 +62,21 @@ class EspBootloaderProtocolTest {
         assertEquals(EspCommands.READ_REG, request.op)
         assertEquals(4, request.payload.size)
         assertEquals(0x40001000L, readU32(request.payload, 0))
-        assertEquals(0x50L, request.checksum)
+        assertEquals(0L, request.checksum)
     }
 
     @Test
-    fun `request checksum is the sum of the payload`() {
-        val data = byteArrayOf(0x01, 0x02, 0x03, 0x7F)
-        val request = parseRequest(EspBootloaderProtocol.requestFrame(EspCommands.SPI_ATTACH, data))
-        assertEquals(0x85L, request.checksum)
-        assertEquals(EspBootloaderProtocol.checksum(data).toLong(), request.checksum)
+    fun `data checksum is the ROM XOR seeded with 0xEF`() {
+        assertEquals(0xEF, EspBootloaderProtocol.checksum(ByteArray(0)))
+        assertEquals(0x90, EspBootloaderProtocol.checksum(byteArrayOf(0x01, 0x02, 0x03, 0x7F)))
+        // esptool: checksum(b"\x00") == 0xEF, checksum(b"\xff") == 0x10
+        assertEquals(0xEF, EspBootloaderProtocol.checksum(byteArrayOf(0x00)))
+        assertEquals(0x10, EspBootloaderProtocol.checksum(byteArrayOf(0xFF.toByte())))
+        // Only data commands carry it; every other command sends 0.
+        val attach = parseRequest(EspBootloaderProtocol.requestFrame(EspCommands.SPI_ATTACH, byteArrayOf(1, 2)))
+        assertEquals(0L, attach.checksum)
+        val data = parseRequest(EspBootloaderProtocol.requestFrame(EspCommands.FLASH_DATA, byteArrayOf(1, 2)))
+        assertEquals(0xECL, data.checksum)
     }
 
     @Test
@@ -82,7 +88,7 @@ class EspBootloaderProtocolTest {
             payload.copyOfRange(0, 4),
         )
         assertTrue(payload.copyOfRange(4, 36).all { it == 0x55.toByte() })
-        assertEquals(0xE0L, parseRequest(EspBootloaderProtocol.syncFrame()).checksum)
+        assertEquals(0L, parseRequest(EspBootloaderProtocol.syncFrame()).checksum)
     }
 
     @Test
@@ -133,7 +139,7 @@ class EspBootloaderProtocolTest {
         assertEquals(0L, readU32(request.payload, 8))
         assertEquals(0L, readU32(request.payload, 12))
         assertArrayEquals(chunk, request.payload.copyOfRange(16, request.payload.size))
-        assertEquals(0xA0L, request.checksum)
+        assertEquals(0xAFL, request.checksum)
     }
 
     @Test
@@ -169,6 +175,25 @@ class EspBootloaderProtocolTest {
         assertEquals(0x00F01D83L, parsed.value)
         assertArrayEquals(byteArrayOf(0x01, 0x02), parsed.data)
         assertFalse(parsed.isSuccess)
+    }
+
+    @Test
+    fun `response status comes from the payload, not from the value field`() {
+        // READ_REG: value is the register magic, the payload is [status, error, 0, 0].
+        val register = EspBootloaderProtocol.parseResponse(
+            responsePacket(EspCommands.READ_REG, 0x00F01D83L, byteArrayOf(0x00, 0x00, 0x00, 0x00)),
+        )
+        assertEquals(0x00F01D83L, register.value)
+        assertTrue(register.isSuccess)
+        assertEquals(0, register.errorCode)
+
+        // FLASH_DATA: value echoes the checksum (non-zero), status 1 / error 7 must fail.
+        val failed = EspBootloaderProtocol.parseResponse(
+            responsePacket(EspCommands.FLASH_DATA, 0xAF, byteArrayOf(0x01, 0x07, 0x00, 0x00)),
+        )
+        assertEquals(1, failed.status)
+        assertEquals(7, failed.errorCode)
+        assertFalse(failed.isSuccess)
     }
 
     @Test

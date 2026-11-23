@@ -130,7 +130,8 @@ fun LogList(
     autoScroll: Boolean = true,
 ) {
     val listState = rememberLazyListState()
-    LaunchedEffect(logs.size) {
+    // Key on the content, not the size: the log lists drop old lines once they reach their cap.
+    LaunchedEffect(logs.size, logs.lastOrNull(), autoScroll) {
         if (autoScroll && logs.isNotEmpty()) {
             listState.scrollToItem(logs.lastIndex)
         }
@@ -210,6 +211,7 @@ fun pinActiveLevelLabel(level: PinActiveLevel): String = when (level) {
 fun PinWiringGuideCard(
     pins: List<PinAssignment>,
     notes: List<String>,
+    powerNote: String? = null,
     modifier: Modifier = Modifier,
 ) {
     SectionCard(
@@ -225,6 +227,15 @@ fun PinWiringGuideCard(
             )
         } else {
             pins.forEach { pin -> PinRow(pin) }
+        }
+        powerNote?.takeIf { it.isNotBlank() }?.let { note ->
+            HorizontalDivider()
+            Text("電源注意", style = MaterialTheme.typography.labelLarge)
+            Text(
+                note,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
         }
         if (notes.isNotEmpty()) {
             HorizontalDivider()
@@ -244,6 +255,7 @@ fun PinWiringGuideCard(
 fun PinWiringDialog(
     pins: List<PinAssignment>,
     notes: List<String>,
+    powerNote: String? = null,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -263,6 +275,15 @@ fun PinWiringDialog(
                     Text("ピン情報はありません。", style = MaterialTheme.typography.bodySmall)
                 } else {
                     pins.forEach { pin -> PinRow(pin) }
+                }
+                powerNote?.takeIf { it.isNotBlank() }?.let { note ->
+                    HorizontalDivider()
+                    Text("電源注意", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        note,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
                 }
                 if (notes.isNotEmpty()) {
                     HorizontalDivider()

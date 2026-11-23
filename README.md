@@ -13,7 +13,7 @@ ESP32-DevKitC 向けの Android 専用 USB OTG ファームウェア書き込み
 - **GitHub Releases 連携書き込み**: 登録したリポジトリ（既定: `yuushi-labs/esp32-devkitc-firmware`）の Release 一覧から `.bin` / `flash-manifest.json` を取得
   - `merged`（`0x0000`）と `parts`（`0x1000` / `0x8000` / `0x10000` など）を自動判別して選択
   - SHA-256（アセット digest / manifest）検証、ETag によるキャッシュ再検証
-- **Pin Wiring Guide**: `flash-manifest.json` の `pins`（`gpio` / `label` / `direction` / `activeLevel` / `note`）と `wiringNotes` をカード表示
+- **Pin Wiring Guide**: `flash-manifest.json` の `pins`（`gpio` / `label` / `direction` / `activeLevel` / `note`）、`wiringNotes`、`powerNote` をカード表示
   - **ESP32-DevKitC ボード図（Compose Canvas）**: トップビューを 30ピン / 38ピン切替で描画し、`pins` の GPIO と参照された GND / 電源ピンへ色付きリング＋ラベルを表示。ピンをタップすると役割・配線メモ・注意点を表示
   - GPIO6〜11（内蔵フラッシュ専用）、GPIO34〜39（入力専用）、3.3V ロジックのリファレンス付き
 - **ローカル `.bin` 書き込み**: SAF で端末内の `.bin` を選び、アドレス指定（`0x0000` 結合済み / `0x10000` アプリ / 任意オフセット）で書き込み
@@ -53,7 +53,19 @@ cd android
 `local.properties` に `sdk.dir` を設定してください（`.gitignore` 済み）。
 
 ### 署名
-Release ビルドは `android/keystore/esp32-flasher.jks`（`CN=yuushi-labs`, alias `esp32-flasher`）で署名します。上書きインストール互換性を保つため鍵はリポジトリに同梱しています。別鍵を使う場合は環境変数 `ESP32_FLASHER_STORE_PASSWORD` / `ESP32_FLASHER_KEY_ALIAS` / `ESP32_FLASHER_KEY_PASSWORD` で上書きできます。
+Release ビルドは `android/keystore/esp32-flasher.jks`（`CN=yuushi-labs`, alias `esp32-flasher`）で署名します。上書きインストール互換性を保つため鍵はリポジトリに同梱しています。
+
+この鍵は公開前提です（仕様 §7）。第三者が同じ鍵で APK に署名できるため、署名一致は「正規ビルドである」ことの証明にはなりません。アプリ内アップデートは Android のインストーラ確認を経由し、署名だけを理由にインストールを自動化しません。
+
+別鍵でプライベートビルドする場合は、パスと認証情報を組で指定します。
+
+```bash
+ESP32_FLASHER_STORE_FILE=/path/to/private.jks \
+ESP32_FLASHER_STORE_PASSWORD=... \
+ESP32_FLASHER_KEY_ALIAS=... \
+ESP32_FLASHER_KEY_PASSWORD=... \
+./gradlew assembleRelease
+```
 
 ```bash
 apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk

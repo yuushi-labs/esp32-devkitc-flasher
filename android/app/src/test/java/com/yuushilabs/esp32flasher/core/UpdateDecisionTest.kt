@@ -64,6 +64,18 @@ class UpdateDecisionTest {
     }
 
     @Test
+    fun `an equal version code is up to date even when the tag looks newer`() {
+        val outcome = UpdateDecision.decide(
+            UpdateCheck(
+                currentVersionCode = 5,
+                currentVersionName = "1.0.0",
+                latest = ReleaseVersion("2.0.0", versionCode = 5),
+            ),
+        )
+        assertEquals(UpdateOutcome.UpToDate, outcome)
+    }
+
+    @Test
     fun `falls back to semantic versions without a version code`() {
         val newer = UpdateDecision.decide(
             UpdateCheck(1, "0.1.0", ReleaseVersion("v0.2.0")),

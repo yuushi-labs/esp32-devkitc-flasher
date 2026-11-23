@@ -46,6 +46,22 @@ class BoardPinoutTest {
     }
 
     @Test
+    fun `header lists run top to bottom as on the board`() {
+        // Antenna up, USB down: EN is top-left, VIN bottom-left, GPIO23 top-right, 3V3 bottom-right.
+        val thirty = BoardVariant.DEVKIT_30
+        assertEquals("EN", thirty.left.first().label)
+        assertEquals("VIN", thirty.left.last().label)
+        assertEquals(23, thirty.right.first().gpio)
+        assertEquals("3V3", thirty.right.last().label)
+
+        val thirtyEight = BoardVariant.DEVKIT_38
+        assertEquals("3V3", thirtyEight.left.first().label)
+        assertEquals("VIN", thirtyEight.left.last().label)
+        assertEquals(BoardPinKind.GROUND, thirtyEight.right.first().kind)
+        assertEquals(6, thirtyEight.right.last().gpio)
+    }
+
+    @Test
     fun `resolves gpio highlights`() {
         val highlights = BoardPinout.resolveHighlights(
             BoardVariant.DEVKIT_38,
@@ -116,6 +132,11 @@ class BoardPinoutTest {
 
         val powerPin = BoardVariant.DEVKIT_38.pins.first { it.label == "3V3" }
         assertTrue(BoardPinout.warningsFor(powerPin).any { it.contains("3.3V") })
+
+        val vinPin = BoardVariant.DEVKIT_38.pins.first { it.label == "VIN" }
+        val vinWarnings = BoardPinout.warningsFor(vinPin)
+        assertTrue(vinWarnings.any { it.contains("VIN") })
+        assertFalse(vinWarnings.any { it.contains("5V を直接入力すると破損") })
 
         val normal = BoardVariant.DEVKIT_38.pinForGpio(25)!!
         assertTrue(BoardPinout.warningsFor(normal).isEmpty())

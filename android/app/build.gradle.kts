@@ -37,7 +37,12 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = rootProject.file("keystore/esp32-flasher.jks")
+            // The bundled key keeps releases overwritable (SPEC §7); a private build can point
+            // ESP32_FLASHER_STORE_FILE at its own JKS together with the password variables.
+            storeFile = System.getenv("ESP32_FLASHER_STORE_FILE")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { file(it) }
+                ?: rootProject.file("keystore/esp32-flasher.jks")
             storePassword = signingValue("ESP32_FLASHER_STORE_PASSWORD", "esp32flasher")
             keyAlias = signingValue("ESP32_FLASHER_KEY_ALIAS", "esp32-flasher")
             keyPassword = signingValue("ESP32_FLASHER_KEY_PASSWORD", "esp32flasher")

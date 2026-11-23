@@ -254,13 +254,14 @@ class EspFlasherEngine(
             try {
                 val response = readResponse(config.syncTimeoutMs)
                 if (response.command == EspCommands.SYNC) {
-                    decoder.reset()
-                    pendingFrames.clear()
+                    drainSyncResponses()
                     listener.onLog("SYNC 応答を受信しました")
                     return
                 }
             } catch (timeout: EspTimeoutException) {
                 // Retry with the next SYNC packet.
+            } catch (protocol: EspProtocolException) {
+                listener.onLog("SYNC 応答を解釈できませんでした: ${protocol.message}")
             }
         }
         throw EspProtocolException(
@@ -389,7 +390,15 @@ class EspFlasherEngine(
         val deadline = clock() + timeoutMs.toLong() * NANOS_PER_MILLI
         while (true) {
             checkCancelled()
-            pendingFrames.removeFirstOrNull()?.let { return EspBootloaderProtocol.parseResponse(it) }
+            val frame = pendingFrames.removeFirstOrNull()
+            if (frame != null) {
+                // Boot text or a truncated frame can show up before the real reply; skip it
+                // instead of failing the whole sequence.
+                val parsed = runCatching { EspBootloaderProtocol.parseResponse(frame) }.getOrNull()
+                if (parsed != null) return parsed
+                listener.onLog("不正な応答フレーム (${frame.size} バイト) を読み捨てました")
+                continue
+            }
             val remainingMs = (deadline - clock()) / NANOS_PER_MILLI
             if (remainingMs <= 0) {
                 throw EspTimeoutException("ESP32 からの応答がタイムアウトしました (${timeoutMs}ms)")
@@ -402,10 +411,35 @@ class EspFlasherEngine(
         }
     }
 
+    /**
+     * The ROM answers a single SYNC packet with 8 identical responses (esptool reads and discards
+     * the extra 7). Leaving them queued would shift the following `READ_REG` by a frame, so the
+     * chip magic and MAC would be wrong.
+     */
+    private fun drainSyncResponses() {
+        val deadline = clock() + SYNC_DRAIN_MS * NANOS_PER_MILLI
+        while (clock() < deadline) {
+            val count = link.read(readBuffer, SYNC_DRAIN_READ_MS)
+            if (count <= 0) break
+            decoder.feed(readBuffer, 0, count)
+        }
+        decoder.reset()
+        pendingFrames.clear()
+    }
+
     private fun requireOk(op: Int, response: EspResponse) {
-        if (response.status != 0) {
+        if (!response.hasStatus) {
             throw EspProtocolException(
-                "コマンド 0x%02X が失敗しました (status=%d)".format(op, response.status),
+                "コマンド 0x%02X の応答にステータスがありません".format(op),
+            )
+        }
+        if (!response.isSuccess) {
+            throw EspProtocolException(
+                "コマンド 0x%02X が失敗しました (status=%d, error=%d)".format(
+                    op,
+                    response.status,
+                    response.errorCode,
+                ),
             )
         }
     }
@@ -440,6 +474,8 @@ class EspFlasherEngine(
         private const val READ_BUFFER_SIZE = 4096
         private const val MAX_READ_TIMEOUT_MS = 100L
         private const val MAX_SKIPPED_FRAMES = 4
+        private const val SYNC_DRAIN_MS = 200L
+        private const val SYNC_DRAIN_READ_MS = 20
         private const val RESET_PULSE_MS = 100L
         private const val RESET_SETTLE_MS = 50L
         private const val BAUD_SWITCH_DELAY_MS = 20L

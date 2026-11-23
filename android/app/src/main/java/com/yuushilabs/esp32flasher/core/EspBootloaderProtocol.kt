@@ -25,18 +25,30 @@ object EspCommands {
     const val ERASE_REGION = 0xD1
     const val READ_FLASH = 0xD2
 
-    fun isFlashData(op: Int): Boolean = op == FLASH_DATA || op == FLASH_DEFL_DATA
+    /** Commands whose request carriage carries a data checksum in the header. */
+    fun isFlashData(op: Int): Boolean = op == FLASH_DATA || op == FLASH_DEFL_DATA || op == MEM_DATA
 }
 
-/** A parsed ROM bootloader response: `direction | op | size | value | data`. */
+/**
+ * A parsed ROM bootloader response: `direction | op | size | value | data`.
+ *
+ * The header `value` field is *not* a status: the ROM puts the checksum of the received block
+ * there for data commands and the register value for `READ_REG`. The status lives in the first
+ * two payload bytes (status, error), followed by two reserved bytes.
+ */
 data class EspResponse(
     val command: Int,
     val value: Long,
     val data: ByteArray,
 ) {
-    val status: Int get() = value.toInt()
+    /** Whether the payload carried the status bytes the ROM appends to every reply. */
+    val hasStatus: Boolean get() = data.size >= 2
 
-    val isSuccess: Boolean get() = status == 0
+    val status: Int get() = if (data.isNotEmpty()) data[0].toInt() and 0xFF else 0
+
+    val errorCode: Int get() = if (data.size >= 2) data[1].toInt() and 0xFF else 0
+
+    val isSuccess: Boolean get() = hasStatus && status == 0
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -83,6 +95,9 @@ object EspBootloaderProtocol {
     const val DEFAULT_STATUS_MASK = 0xFFFF
     const val COMPRESSION_LEVEL = 9
 
+    /** Seed of the ROM data checksum (`ESP_CHECKSUM_MAGIC` in esptool). */
+    const val CHECKSUM_SEED = 0xEF
+
     private const val SYNC_DATA = 0x07
     private const val SYNC_DATA_2 = 0x12
     private const val SYNC_DATA_3 = 0x20
@@ -114,10 +129,30 @@ object EspBootloaderProtocol {
         return out.toByteArray()
     }
 
-    fun requestFrame(op: Int, data: ByteArray = ByteArray(0), checksum: Int = checksum(data)): ByteArray =
-        SlipCodec.encode(requestPacket(op, data, checksum))
+    /**
+     * SLIP frame for [op]. Only data commands carry a checksum (XOR of the block starting from
+     * [CHECKSUM_SEED]); every other command sends 0, exactly like `esptool`.
+     */
+    fun requestFrame(op: Int, data: ByteArray = ByteArray(0), checksum: Int? = null): ByteArray =
+        SlipCodec.encode(
+            requestPacket(
+                op,
+                data,
+                checksum ?: if (EspCommands.isFlashData(op)) EspBootloaderProtocol.checksum(data) else 0,
+            ),
+        )
 
-    fun checksum(data: ByteArray): Int = data.sumOf { it.toInt() and 0xFF } and 0xFF
+    /**
+     * ROM checksum: XOR of every data byte starting from [CHECKSUM_SEED] (0xEF), which is what the
+     * bootloader verifies for `MEM_DATA`, `FLASH_DATA` and `FLASH_DEFL_DATA`.
+     */
+    fun checksum(data: ByteArray, seed: Int = CHECKSUM_SEED): Int {
+        var value = seed and 0xFF
+        for (byte in data) {
+            value = value xor (byte.toInt() and 0xFF)
+        }
+        return value and 0xFF
+    }
 
     fun parseResponse(frame: ByteArray): EspResponse {
         if (frame.size < 8) {
@@ -176,7 +211,7 @@ object EspBootloaderProtocol {
     fun flashDataFrame(chunk: ByteArray, seq: Int, compressed: Boolean = false): ByteArray = requestFrame(
         if (compressed) EspCommands.FLASH_DEFL_DATA else EspCommands.FLASH_DATA,
         uint32(chunk.size) + uint32(seq) + uint32(0) + uint32(0) + chunk,
-        checksum(chunk),
+        EspBootloaderProtocol.checksum(chunk),
     )
 
     fun flashEndFrame(stayInLoader: Boolean = false, compressed: Boolean = false): ByteArray = requestFrame(

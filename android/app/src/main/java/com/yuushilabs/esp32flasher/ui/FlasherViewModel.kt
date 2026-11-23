@@ -14,6 +14,7 @@ import com.yuushilabs.esp32flasher.core.FlashManifest
 import com.yuushilabs.esp32flasher.core.FlashManifestParser
 import com.yuushilabs.esp32flasher.core.HexAddressParser
 import com.yuushilabs.esp32flasher.core.ReleaseAsset
+import com.yuushilabs.esp32flasher.core.Sha256Status
 import com.yuushilabs.esp32flasher.data.AppSettings
 import com.yuushilabs.esp32flasher.github.ChecksumMismatchException
 import com.yuushilabs.esp32flasher.github.RepoRef
@@ -35,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -107,6 +109,9 @@ class FlasherViewModel(
     private var flashJob: Job? = null
     private var addressInitialized = false
     private var releasesRequested = false
+
+    /** Bumped whenever the user picks another release or file, so stale downloads are dropped. */
+    private var selectionGeneration = 0
 
     private val listener = object : FlashListener {
         override fun onStage(stage: FlashStage) {
@@ -196,13 +201,17 @@ class FlasherViewModel(
     fun loadReleases(force: Boolean = false) {
         if (_state.value.releasesLoading) return
         releasesRequested = true
-        val repository = RepoRef.parse(settings?.repository ?: BuildConfig.DEFAULT_FIRMWARE_REPO)
-        if (repository == null) {
-            _state.update { it.copy(releasesError = "リポジトリ設定が不正です") }
-            return
-        }
         _state.update { it.copy(releasesLoading = true, releasesError = null) }
         viewModelScope.launch {
+            // The saved repository and token are applied before the first request; otherwise a
+            // private repository would answer 404 on the very first launch.
+            container.awaitSettingsLoaded()
+            val loaded = container.settingsRepository.settings.first()
+            val repository = RepoRef.parse(loaded.repository)
+            if (repository == null) {
+                _state.update { it.copy(releasesLoading = false, releasesError = "リポジトリ設定が不正です") }
+                return@launch
+            }
             try {
                 val result = container.releaseClient.listReleases(repository, forceRefresh = force)
                 val releases = result.releases.filter { !it.draft }
@@ -232,11 +241,14 @@ class FlasherViewModel(
     }
 
     fun selectRelease(release: FirmwareRelease) {
+        val generation = ++selectionGeneration
+        // The previous release's image must not stay selected while the new one resolves.
         _state.update {
             it.copy(
                 selectedRelease = release,
                 manifest = null,
                 manifestLoading = false,
+                selection = null,
             )
         }
         val manifestAsset = release.manifestAsset
@@ -249,6 +261,7 @@ class FlasherViewModel(
         viewModelScope.launch {
             try {
                 val manifest = container.releaseClient.fetchManifest(manifestAsset)
+                if (generation != selectionGeneration) return@launch
                 _state.update { it.copy(manifest = manifest, manifestLoading = false) }
                 appendLog(
                     "flash-manifest.json を読み込みました " +
@@ -267,6 +280,7 @@ class FlasherViewModel(
                     )
                 }
             } catch (error: Exception) {
+                if (generation != selectionGeneration) return@launch
                 _state.update { it.copy(manifestLoading = false) }
                 appendLog("Manifest の取得に失敗しました: ${error.message}", LogLevel.WARN)
                 release.primaryBinary?.let { selectAsset(release, it) }
@@ -312,6 +326,7 @@ class FlasherViewModel(
     }
 
     fun selectLocalFile(uri: Uri) {
+        selectionGeneration++
         viewModelScope.launch {
             val info = withContext(Dispatchers.IO) {
                 runCatching { queryLocalFile(uri) }.getOrNull()
@@ -383,14 +398,20 @@ class FlasherViewModel(
             val outcome = try {
                 val bytes = resolveBytes(selection)
                 appendLog("イメージサイズ: ${bytes.size} バイト")
-                container.usbManager.stopMonitoring()
-                val engine = EspFlasherEngine(
-                    link = link,
-                    config = config,
-                    listener = listener,
-                    cancellation = { cancelRequested },
+                val resumeMonitoring = container.usbManager.beginExclusiveAccess(
+                    settings?.monitorBaudRate ?: AppSettings.DEFAULT_MONITOR_BAUD,
                 )
-                withContext(Dispatchers.IO) { engine.flash(bytes, address) }
+                try {
+                    val engine = EspFlasherEngine(
+                        link = link,
+                        config = config,
+                        listener = listener,
+                        cancellation = { cancelRequested },
+                    )
+                    withContext(Dispatchers.IO) { engine.flash(bytes, address) }
+                } finally {
+                    container.usbManager.endExclusiveAccess(resumeMonitoring)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -450,8 +471,15 @@ class FlasherViewModel(
                 }
             }
             _state.update { it.copy(downloadProgress = null) }
-            if (!FlashManifestParser.verifySha256(bytes, selection.image.sha256)) {
-                throw ChecksumMismatchException("SHA-256 が一致しません: ${selection.asset.name}")
+            when (FlashManifestParser.checkSha256(bytes, selection.image.sha256)) {
+                Sha256Status.MISMATCH ->
+                    throw ChecksumMismatchException("SHA-256 が一致しません: ${selection.asset.name}")
+
+                Sha256Status.NOT_AVAILABLE ->
+                    appendLog("Manifest に SHA-256 がないため検証をスキップしました", LogLevel.WARN)
+
+                Sha256Status.VERIFIED ->
+                    appendLog("SHA-256 を検証しました: ${selection.asset.name}")
             }
             appendLog("${bytes.size} バイトを取得しました", LogLevel.SUCCESS)
             bytes
@@ -482,11 +510,21 @@ class FlasherViewModel(
         val resolver = getApplication<Application>().contentResolver
         val input = resolver.openInputStream(uri) ?: throw IOException("ファイルを開けませんでした")
         return input.use { stream ->
-            val bytes = stream.readBytes()
-            if (bytes.isEmpty()) throw IOException("ファイルが空です")
-            if (bytes.size > MAX_IMAGE_BYTES) {
-                throw IOException("ファイルが大きすぎます (最大 ${MAX_IMAGE_BYTES / 1024 / 1024} MB)")
+            // Read in chunks so an oversized pick fails on the limit instead of on the heap.
+            val out = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(64 * 1024)
+            var total = 0
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_IMAGE_BYTES) {
+                    throw IOException("ファイルが大きすぎます (最大 ${MAX_IMAGE_BYTES / 1024 / 1024} MB)")
+                }
+                out.write(buffer, 0, read)
             }
+            val bytes = out.toByteArray()
+            if (bytes.isEmpty()) throw IOException("ファイルが空です")
             bytes
         }
     }

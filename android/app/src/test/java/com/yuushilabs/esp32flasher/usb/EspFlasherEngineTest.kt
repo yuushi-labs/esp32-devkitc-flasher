@@ -32,6 +32,9 @@ class EspFlasherEngineTest {
         private val macHigh: Long = 0x0000F00DL,
         private val failDeflatedBegin: Boolean = false,
         private val syncsToIgnore: Int = 0,
+        private val syncResponses: Int = 8,
+        private val emitNoiseBeforeReplies: Boolean = false,
+        private val rejectDataCommands: Boolean = false,
         private val alwaysSilent: Boolean = false,
     ) : SerialLink {
         override var baudRate: Int = 115_200
@@ -89,40 +92,61 @@ class EspFlasherEngineTest {
                 EspCommands.SYNC -> {
                     syncRequests++
                     if (syncRequests > syncsToIgnore) {
-                        respond(op, 0, EspBootloaderProtocol.syncPayload())
+                        // The real ROM answers a SYNC packet 8 times.
+                        repeat(syncResponses) { respond(op) }
                     }
                 }
 
-                EspCommands.READ_REG -> respond(op, registerValue(request.u32(0)), ByteArray(0))
+                EspCommands.READ_REG -> {
+                    noise(op)
+                    respond(op, value = registerValue(request.u32(0)))
+                }
 
-                EspCommands.SPI_ATTACH, EspCommands.SPI_SET_PARAMS -> respond(op, 0, ByteArray(0))
+                EspCommands.SPI_ATTACH, EspCommands.SPI_SET_PARAMS -> {
+                    noise(op)
+                    respond(op)
+                }
 
                 EspCommands.FLASH_BEGIN -> {
                     lastFlashBegin = request
-                    respond(op, 0, ByteArray(0))
+                    respond(op)
                 }
 
                 EspCommands.FLASH_DEFL_BEGIN -> {
                     if (failDeflatedBegin) {
-                        respond(op, 1, ByteArray(0))
+                        respond(op, status = 1, errorCode = 1)
                     } else {
                         lastFlashBegin = request
-                        respond(op, 0, ByteArray(0))
+                        respond(op)
                     }
                 }
 
                 EspCommands.FLASH_DATA, EspCommands.FLASH_DEFL_DATA -> {
-                    flashPayload.write(payload.copyOfRange(16, payload.size))
-                    respond(op, 0, ByteArray(0))
+                    val chunk = payload.copyOfRange(16, payload.size)
+                    val expected = EspBootloaderProtocol.checksum(chunk).toLong()
+                    if (rejectDataCommands || request.checksum != expected) {
+                        // 0x07 = CHECKSUM_ERROR
+                        respond(op, status = 1, errorCode = 7)
+                    } else {
+                        flashPayload.write(chunk)
+                        respond(op)
+                    }
                 }
 
                 EspCommands.FLASH_END, EspCommands.FLASH_DEFL_END -> {
                     lastFlashEnd = request
-                    respond(op, 0, ByteArray(0))
+                    respond(op)
                 }
 
-                else -> respond(op, 0, ByteArray(0))
+                else -> respond(op)
             }
+        }
+
+        /** A frame the parser must discard, e.g. boot text leaked into the stream. */
+        private fun noise(op: Int) {
+            if (!emitNoiseBeforeReplies) return
+            val packet = byteArrayOf(0x02, op.toByte(), 0, 0, 0, 0, 0, 0)
+            SlipCodec.encode(packet).forEach { pending.addLast(it) }
         }
 
         private fun registerValue(address: Long): Long = when (address) {
@@ -132,16 +156,24 @@ class EspFlasherEngineTest {
             else -> 0L
         }
 
-        private fun respond(op: Int, value: Long, data: ByteArray) {
-            val packet = ByteArray(8 + data.size)
+        private fun respond(
+            op: Int,
+            status: Int = 0,
+            errorCode: Int = 0,
+            value: Long = 0,
+            data: ByteArray = ByteArray(0),
+        ) {
+            // The ROM appends [status, error, reserved, reserved] to every reply payload.
+            val payload = data + byteArrayOf(status.toByte(), errorCode.toByte(), 0, 0)
+            val packet = ByteArray(8 + payload.size)
             packet[0] = 0x01
             packet[1] = op.toByte()
-            packet[2] = (data.size and 0xFF).toByte()
-            packet[3] = ((data.size shr 8) and 0xFF).toByte()
+            packet[2] = (payload.size and 0xFF).toByte()
+            packet[3] = ((payload.size shr 8) and 0xFF).toByte()
             for (index in 0 until 4) {
                 packet[4 + index] = ((value shr (8 * index)) and 0xFF).toByte()
             }
-            data.copyInto(packet, 8)
+            payload.copyInto(packet, 8)
             SlipCodec.encode(packet).forEach { pending.addLast(it) }
         }
     }
@@ -179,6 +211,33 @@ class EspFlasherEngineTest {
         assertEquals("cd:ab:34:12:0d:f0", chip.macAddress)
         assertEquals("ESP32 (cd:ab:34:12:0d:f0)", chip.displayName)
         assertTrue(device.syncRequests >= 1)
+    }
+
+    @Test
+    fun `the extra sync responses are drained before reading the chip id`() {
+        // The ROM replies 8 times to one SYNC; leaving 7 queued would shift every later reply.
+        val device = FakeEspDevice(syncResponses = 8)
+        val chip = engine(device).connect()
+        assertEquals(1, device.syncRequests)
+        assertEquals("ESP32", chip.name)
+        assertEquals("cd:ab:34:12:0d:f0", chip.macAddress)
+    }
+
+    @Test
+    fun `unparseable frames are skipped instead of failing the sequence`() {
+        val device = FakeEspDevice(emitNoiseBeforeReplies = true)
+        val chip = engine(device).connect()
+        assertEquals("ESP32", chip.name)
+        val outcome = engine(device).flash(ByteArray(1024) { 3 }, 0x0)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+    }
+
+    @Test
+    fun `a rom status error fails the flash`() {
+        val device = FakeEspDevice(rejectDataCommands = true)
+        val outcome = engine(device).flash(ByteArray(2048) { 1 }, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Failure)
+        assertTrue((outcome as FlashOutcome.Failure).message.contains("status=1"))
     }
 
     @Test
@@ -237,6 +296,8 @@ class EspFlasherEngineTest {
                 command.checksum,
             )
             assertTrue(chunk.size <= 1024)
+            // Never the all-zero or sum checksum the ROM would reject.
+            if (chunk.isNotEmpty()) assertTrue(command.checksum != 0L)
         }
         assertEquals(EspCommands.FLASH_DEFL_END, device.lastFlashEnd?.op)
         assertEquals(0L, device.lastFlashEnd!!.u32(0))

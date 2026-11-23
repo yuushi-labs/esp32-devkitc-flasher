@@ -60,6 +60,13 @@ class UsbSerialManager(private val context: Context) {
     @Volatile
     private var monitoring = false
 
+    /** True while a flash owns the port, so the monitor pump and reset pulses stay out of it. */
+    @Volatile
+    private var exclusiveAccess = false
+
+    @Volatile
+    private var lastMonitorBaud: Int? = null
+
     private var monitorThread: Thread? = null
 
     val link: SerialLink? get() = transport
@@ -152,9 +159,16 @@ class UsbSerialManager(private val context: Context) {
         refreshDevices()
     }
 
-    fun startMonitoring() {
+    fun startMonitoring(baudRate: Int? = null) {
+        if (exclusiveAccess) return
         val current = transport ?: return
         if (monitoring) return
+        // The port may have been opened at the flash baud rate; the monitor has its own.
+        if (baudRate != null && baudRate > 0 && baudRate != current.baudRate) {
+            runCatching { current.setBaudRate(baudRate) }
+                .onSuccess { _state.value = ConnectionState.Connected(current.deviceLabel, baudRate) }
+        }
+        if (baudRate != null && baudRate > 0) lastMonitorBaud = baudRate
         monitoring = true
         monitorThread = Thread({
             val buffer = ByteArray(4096)
@@ -183,6 +197,9 @@ class UsbSerialManager(private val context: Context) {
     }
 
     fun write(data: ByteArray): Result<Unit> {
+        if (exclusiveAccess) {
+            return Result.failure(IOException("書き込み中はシリアルモニターから送信できません"))
+        }
         val current = transport ?: return Result.failure(IOException("シリアルポートが接続されていません"))
         return runCatching { current.write(data) }
     }
@@ -201,10 +218,29 @@ class UsbSerialManager(private val context: Context) {
 
     /** Pulses EN low to reset the ESP32 without entering the bootloader. */
     fun pulseReset() {
+        if (exclusiveAccess) return
         val current = transport ?: return
         current.setDtrRts(false, true)
         runCatching { Thread.sleep(RESET_PULSE_MS) }
         current.setDtrRts(false, false)
+    }
+
+    /**
+     * Takes the port away from the monitor pump for a flash. Returns whether the monitor was
+     * running, so [endExclusiveAccess] can put it back exactly as it was.
+     */
+    fun beginExclusiveAccess(baudRate: Int): Boolean {
+        if (exclusiveAccess) return false
+        exclusiveAccess = true
+        if (baudRate > 0) lastMonitorBaud = baudRate
+        val wasMonitoring = monitoring
+        if (wasMonitoring) stopMonitoring()
+        return wasMonitoring
+    }
+
+    fun endExclusiveAccess(resumeMonitoring: Boolean) {
+        exclusiveAccess = false
+        if (resumeMonitoring && !monitoring) startMonitoring(lastMonitorBaud)
     }
 
     private fun describe(device: UsbDevice, driver: UsbSerialDriver?): String {

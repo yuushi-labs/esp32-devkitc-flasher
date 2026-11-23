@@ -51,12 +51,14 @@ data class FlashManifest(
     val parts: List<FlashImage> = emptyList(),
     val pins: List<PinAssignment> = emptyList(),
     val wiringNotes: List<String> = emptyList(),
+    val powerNote: String? = null,
 ) {
     val allImages: List<FlashImage> get() = listOfNotNull(merged) + parts
 
     val isEmpty: Boolean get() = allImages.isEmpty()
 
-    val hasWiringGuide: Boolean get() = pins.isNotEmpty() || wiringNotes.isNotEmpty()
+    val hasWiringGuide: Boolean
+        get() = pins.isNotEmpty() || wiringNotes.isNotEmpty() || !powerNote.isNullOrBlank()
 }
 
 /** An asset attached to a GitHub release. */
@@ -111,6 +113,15 @@ data class FirmwareRelease(
     val hasFlashableContent: Boolean get() = manifestAsset != null || binaryAssets.isNotEmpty()
 }
 
+/** Result of comparing a downloaded image against the manifest checksum. */
+enum class Sha256Status {
+    VERIFIED,
+    MISMATCH,
+
+    /** The manifest has no usable 64 character digest, so nothing could be compared. */
+    NOT_AVAILABLE,
+}
+
 class ManifestFormatException(message: String) : Exception(message)
 
 /**
@@ -155,6 +166,7 @@ object FlashManifestParser {
             parts = parts,
             pins = parsePins(obj),
             wiringNotes = parseWiringNotes(obj),
+            powerNote = obj.str("powerNote", "power_note", "powerHint", "power_hint"),
         )
     }
 
@@ -199,11 +211,21 @@ object FlashManifestParser {
         return digits?.toIntOrNull()
     }
 
-    private fun parseDirection(value: String?): PinDirection = when (value?.lowercase()) {
-        "input", "in", "read" -> PinDirection.INPUT
-        "output", "out", "write" -> PinDirection.OUTPUT
-        "bidirectional", "bidir", "io", "inout", "in_out" -> PinDirection.BIDIRECTIONAL
-        else -> PinDirection.UNKNOWN
+    private fun parseDirection(value: String?): PinDirection {
+        val normalized = value?.trim()?.lowercase()?.replace('-', '_') ?: return PinDirection.UNKNOWN
+        return when {
+            normalized.startsWith("input") || normalized == "in" || normalized == "read" ->
+                PinDirection.INPUT
+
+            normalized.startsWith("output") || normalized == "out" || normalized == "write" ->
+                PinDirection.OUTPUT
+
+            normalized == "bidirectional" || normalized == "bidir" ||
+                normalized == "io" || normalized == "inout" || normalized == "in_out" ->
+                PinDirection.BIDIRECTIONAL
+
+            else -> PinDirection.UNKNOWN
+        }
     }
 
     private fun parseActiveLevel(value: String?): PinActiveLevel = when (value?.lowercase()) {
@@ -237,7 +259,12 @@ object FlashManifestParser {
         val fileName = obj.str(*FILE_KEYS)
             ?.takeIf { it.isNotBlank() }
             ?: throw ManifestFormatException("$label にファイル名がありません")
-        val address = obj.num(*ADDRESS_KEYS) ?: defaultAddress ?: inferAddress(fileName)
+        // Writing at the wrong offset silently overwrites other regions, so an image whose
+        // offset cannot be read or inferred is rejected instead of defaulting to 0x0000.
+        val address = obj.num(*ADDRESS_KEYS) ?: defaultAddress ?: inferAddressOrNull(fileName)
+            ?: throw ManifestFormatException(
+                "$label ($fileName) の書き込みアドレスがなく、ファイル名からも判定できません",
+            )
         return FlashImage(
             name = obj.str("name", "label", "id") ?: fileName,
             fileName = fileName,
@@ -301,7 +328,10 @@ object FlashManifestParser {
      * Guesses the flash offset from an asset name, so a release without a manifest still has a
      * sensible default.
      */
-    fun inferAddress(fileName: String): Long {
+    fun inferAddress(fileName: String): Long = inferAddressOrNull(fileName) ?: AddressPreset.MERGED.address
+
+    /** Like [inferAddress] but tells "not recognised" apart from `0x0`. */
+    fun inferAddressOrNull(fileName: String): Long? {
         val lower = fileName.lowercase()
         return when {
             listOf("merged", "full", "combined", "all").any { lower.contains(it) } -> 0x0000L
@@ -309,7 +339,7 @@ object FlashManifestParser {
             lower.contains("partition") -> 0x8000L
             lower.contains("otadata") || lower.contains("boot_app0") -> 0xE000L
             lower.contains("app") || lower.contains("firmware") || lower.contains("main") -> 0x10000L
-            else -> 0x0000L
+            else -> null
         }
     }
 
@@ -324,11 +354,22 @@ object FlashManifestParser {
     fun sha256Hex(data: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
 
-    fun verifySha256(data: ByteArray, expected: String?): Boolean {
-        val normalized = expected?.normalizeSha() ?: return true
-        if (normalized.length != 64) return true
-        return sha256Hex(data).equals(normalized, ignoreCase = true)
+    /**
+     * Compares [data] with the manifest digest and distinguishes "verified", "mismatch" and
+     * "nothing to compare", so a typo or truncated digest cannot pass silently.
+     */
+    fun checkSha256(data: ByteArray, expected: String?): Sha256Status {
+        val normalized = expected?.normalizeSha()?.takeIf { it.length == 64 }
+            ?: return Sha256Status.NOT_AVAILABLE
+        return if (sha256Hex(data).equals(normalized, ignoreCase = true)) {
+            Sha256Status.VERIFIED
+        } else {
+            Sha256Status.MISMATCH
+        }
     }
+
+    fun verifySha256(data: ByteArray, expected: String?): Boolean =
+        checkSha256(data, expected) != Sha256Status.MISMATCH
 
     private fun parseElement(text: String, label: String): JsonElement =
         try {

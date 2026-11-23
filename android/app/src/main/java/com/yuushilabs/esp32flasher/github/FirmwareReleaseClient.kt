@@ -150,7 +150,9 @@ class FirmwareReleaseClient(
         }
 
     suspend fun fetchManifest(asset: ReleaseAsset): FlashManifest =
-        FlashManifestParser.parseManifest(String(downloadBytes(asset.downloadUrl, null), Charsets.UTF_8))
+        FlashManifestParser.parseManifest(
+            String(downloadBytes(asset.downloadUrl, null, MAX_MANIFEST_BYTES), Charsets.UTF_8),
+        )
 
     suspend fun downloadAsset(
         asset: ReleaseAsset,
@@ -172,6 +174,7 @@ class FirmwareReleaseClient(
     private suspend fun downloadBytes(
         url: String,
         onProgress: ((Long, Long) -> Unit)?,
+        maxBytes: Long = MAX_IN_MEMORY_BYTES,
     ): ByteArray = withContext(ioDispatcher) {
         val request = Request.Builder()
             .url(url)
@@ -185,16 +188,24 @@ class FirmwareReleaseClient(
             if (!response.isSuccessful) throw apiError(response.code, response.body?.string())
             val body = response.body ?: throw GitHubApiException(response.code, "応答が空です")
             val total = body.contentLength()
+            if (total > maxBytes) {
+                throw IOException("ダウンロードサイズが上限を超えています (${total} バイト / 上限 $maxBytes)")
+            }
             val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
-            ByteArrayOutputStream(if (total in 1L..MAX_IN_MEMORY_BYTES) total.toInt() else 64 * 1024).use { out ->
+            ByteArrayOutputStream(if (total in 1L..maxBytes) total.toInt() else 64 * 1024).use { out ->
                 body.byteStream().use { input ->
                     var read: Int
                     var downloaded = 0L
                     while (true) {
                         read = input.read(buffer)
                         if (read <= 0) break
-                        out.write(buffer, 0, read)
                         downloaded += read
+                        if (downloaded > maxBytes) {
+                            throw IOException(
+                                "ダウンロードサイズが上限を超えています (上限 $maxBytes バイト)",
+                            )
+                        }
+                        out.write(buffer, 0, read)
                         onProgress?.invoke(downloaded, total)
                     }
                 }
@@ -219,6 +230,7 @@ class FirmwareReleaseClient(
         private const val API_VERSION = "2022-11-28"
         private const val DOWNLOAD_BUFFER_SIZE = 16 * 1024
         private const val MAX_IN_MEMORY_BYTES = 32L * 1024 * 1024
+        private const val MAX_MANIFEST_BYTES = 1L * 1024 * 1024
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)

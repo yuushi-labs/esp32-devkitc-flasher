@@ -7,6 +7,7 @@ import com.yuushilabs.esp32flasher.github.FirmwareReleaseClient
 import com.yuushilabs.esp32flasher.update.AppUpdateManager
 import com.yuushilabs.esp32flasher.usb.UsbSerialManager
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -18,6 +19,9 @@ class AppContainer(context: Context) {
     private val appContext = context.applicationContext
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val githubToken = AtomicReference<String?>(null)
+
+    /** Completed once the saved settings (and with them the optional token) are loaded. */
+    private val settingsLoaded = CompletableDeferred<Unit>()
 
     val settingsRepository = AppSettingsRepository(appContext, BuildConfig.DEFAULT_FIRMWARE_REPO)
 
@@ -39,8 +43,14 @@ class AppContainer(context: Context) {
         appScope.launch {
             settingsRepository.settings.collect { settings ->
                 githubToken.set(settings.githubToken.ifBlank { null })
+                settingsLoaded.complete(Unit)
             }
         }
+    }
+
+    /** Waits until the stored token can be applied to the next GitHub request. */
+    suspend fun awaitSettingsLoaded() {
+        settingsLoaded.await()
     }
 }
 

@@ -110,6 +110,7 @@ fun FlasherScreen(
             PinWiringGuideCard(
                 pins = state.manifest?.pins.orEmpty(),
                 notes = state.manifest?.wiringNotes.orEmpty(),
+                powerNote = state.manifest?.powerNote,
             )
         }
         item {
@@ -141,6 +142,7 @@ fun FlasherScreen(
         PinWiringDialog(
             pins = state.manifest?.pins.orEmpty(),
             notes = state.manifest?.wiringNotes.orEmpty(),
+            powerNote = state.manifest?.powerNote,
             onDismiss = { showPinDialog = false },
         )
     }

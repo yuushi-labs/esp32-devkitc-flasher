@@ -2,6 +2,7 @@ package com.yuushilabs.esp32flasher.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -276,8 +277,103 @@ class FlashManifestParserTest {
     }
 
     @Test
+    fun `sha256 check distinguishes mismatch from a missing digest`() {
+        val abc = "abc".toByteArray()
+        assertEquals(
+            Sha256Status.VERIFIED,
+            FlashManifestParser.checkSha256(abc, FlashManifestParser.sha256Hex(abc)),
+        )
+        assertEquals(Sha256Status.MISMATCH, FlashManifestParser.checkSha256(abc, sha))
+        assertEquals(Sha256Status.NOT_AVAILABLE, FlashManifestParser.checkSha256(abc, null))
+        assertEquals(Sha256Status.NOT_AVAILABLE, FlashManifestParser.checkSha256(abc, "too-short"))
+    }
+
+    @Test
     fun `manifest images expose a hex address label`() {
         val manifest = FlashManifestParser.parseManifest(fullManifest)
         assertEquals("0x10000", manifest.parts[1].addressLabel)
+    }
+
+    @Test
+    fun `parts without a usable address are rejected`() {
+        assertThrows(ManifestFormatException::class.java) {
+            FlashManifestParser.parseManifest("""{"parts":[{"file":"mystery.bin"}]}""")
+        }
+    }
+
+    @Test
+    fun `power note and pull up directions are parsed`() {
+        val manifest = FlashManifestParser.parseManifest(
+            """{"merged":"a.bin","powerNote":"5V は VIN へ","pins":[""" +
+                """{"gpio":5,"label":"SW","direction":"input_pullup","activeLevel":"low"},""" +
+                """{"gpio":4,"label":"OUT","direction":"output_open_drain"}]}""",
+        )
+        assertEquals("5V は VIN へ", manifest.powerNote)
+        assertEquals(PinDirection.INPUT, manifest.pins[0].direction)
+        assertEquals(PinDirection.OUTPUT, manifest.pins[1].direction)
+        assertTrue(manifest.hasWiringGuide)
+    }
+
+    /** Fixtures copied from the published yuushi-labs/esp32-devkitc-firmware releases. */
+    private fun fixture(name: String): String =
+        checkNotNull(javaClass.classLoader?.getResourceAsStream(name)) { "missing fixture $name" }
+            .use { it.readBytes().toString(Charsets.UTF_8) }
+
+    @Test
+    fun `parses the real v011 firmware manifest`() {
+        val manifest = FlashManifestParser.parseManifest(fixture("flash-manifest-v0.1.1.json"))
+        assertEquals("0.1.1", manifest.version)
+        assertEquals("esp32", manifest.chip)
+        assertEquals("4MB", manifest.flashSize)
+
+        val merged = manifest.merged!!
+        assertEquals("esp32-devkitc-firmware-merged.bin", merged.fileName)
+        assertEquals(0L, merged.address)
+        assertEquals(335856L, merged.sizeBytes)
+        assertEquals(
+            "39ffd84e78cd2a089ffd8fa852ae4b1d0dddf6e7379665f697f8f89544c32947",
+            merged.sha256,
+        )
+        assertEquals(1, manifest.parts.size)
+        assertEquals(0x10000L, manifest.parts[0].address)
+        assertEquals("esp32-devkitc-firmware-app.bin", manifest.parts[0].fileName)
+        assertEquals(
+            "esp32-devkitc-firmware-merged.bin",
+            FlashManifestParser.selectImages(manifest).single().fileName,
+        )
+
+        assertEquals(2, manifest.pins.size)
+        val led = manifest.pins[0]
+        assertEquals(2, led.gpio)
+        assertTrue(led.label.contains("LED"))
+        assertEquals(PinDirection.OUTPUT, led.direction)
+        assertEquals(PinActiveLevel.HIGH, led.activeLevel)
+        assertNotNull(led.note)
+
+        val boot = manifest.pins[1]
+        assertEquals(0, boot.gpio)
+        assertTrue(boot.label.contains("BOOT"))
+        // The manifest writes "input_pullup"; it must still read as an input.
+        assertEquals(PinDirection.INPUT, boot.direction)
+        assertEquals(PinActiveLevel.LOW, boot.activeLevel)
+
+        assertEquals(4, manifest.wiringNotes.size)
+        assertTrue(manifest.wiringNotes[0].contains("3.3V"))
+        assertEquals(
+            "3.3Vロジック専用（5V入力禁止）。5V を使う場合は VIN へ接続",
+            manifest.powerNote,
+        )
+        assertTrue(manifest.hasWiringGuide)
+    }
+
+    @Test
+    fun `parses the real v010 firmware manifest that has no wiring guide`() {
+        val manifest = FlashManifestParser.parseManifest(fixture("flash-manifest-v0.1.0.json"))
+        assertEquals("0.1.0", manifest.version)
+        assertEquals(334288L, manifest.merged?.sizeBytes)
+        assertTrue(manifest.pins.isEmpty())
+        assertTrue(manifest.wiringNotes.isEmpty())
+        assertNull(manifest.powerNote)
+        assertFalse(manifest.hasWiringGuide)
     }
 }

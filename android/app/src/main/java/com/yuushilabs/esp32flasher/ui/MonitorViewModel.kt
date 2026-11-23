@@ -7,6 +7,9 @@ import com.yuushilabs.esp32flasher.AppContainer
 import com.yuushilabs.esp32flasher.data.AppSettings
 import com.yuushilabs.esp32flasher.data.NewlineMode
 import com.yuushilabs.esp32flasher.usb.UsbSerialManager
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CodingErrorAction
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -48,6 +51,12 @@ class MonitorViewModel(
     private val partialLine = StringBuilder()
     private var monitoring = false
 
+    /** Keeps a multi-byte UTF-8 character that was split across USB read boundaries. */
+    private val utf8Decoder = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPLACE)
+        .onUnmappableCharacter(CodingErrorAction.REPLACE)
+    private val decodeBuffer = CharBuffer.allocate(16 * 1024)
+
     init {
         viewModelScope.launch {
             container.usbManager.received.collect(::handleBytes)
@@ -71,9 +80,9 @@ class MonitorViewModel(
     }
 
     fun startMonitoring() {
-        if (monitoring) return
         monitoring = true
-        container.usbManager.startMonitoring()
+        // The port may still be at the flash baud rate; the monitor has its own.
+        container.usbManager.startMonitoring(_state.value.baudRate)
     }
 
     fun stopMonitoring() {
@@ -136,6 +145,7 @@ class MonitorViewModel(
 
     fun clear() {
         partialLine.setLength(0)
+        utf8Decoder.reset()
         _state.update { it.copy(lines = emptyList()) }
     }
 
@@ -151,7 +161,8 @@ class MonitorViewModel(
     }
 
     private fun handleBytes(bytes: ByteArray) {
-        val text = String(bytes, Charsets.UTF_8)
+        val text = decode(bytes)
+        if (text.isEmpty()) return
         partialLine.append(text)
         var newlineIndex = partialLine.indexOf("\n")
         val completed = mutableListOf<String>()
@@ -170,6 +181,20 @@ class MonitorViewModel(
             val lines = current.lines + completed.map { MonitorLine(timestamp, it) }
             current.copy(lines = lines.takeLast(MAX_MONITOR_LINES))
         }
+    }
+
+    /** Decodes [bytes] while keeping an incomplete trailing UTF-8 sequence for the next chunk. */
+    private fun decode(bytes: ByteArray): String {
+        val input = ByteBuffer.wrap(bytes)
+        val text = StringBuilder()
+        while (true) {
+            decodeBuffer.clear()
+            val result = utf8Decoder.decode(input, decodeBuffer, false)
+            decodeBuffer.flip()
+            text.append(decodeBuffer)
+            if (!result.isOverflow) break
+        }
+        return text.toString()
     }
 
     private fun appendLocal(text: String, level: LogLevel) {

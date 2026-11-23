@@ -22,9 +22,10 @@ class HexAddressParserTest {
     }
 
     @Test
-    fun `decimal prefix is supported`() {
-        assertEquals(4096L, HexAddressParser.parse("0d4096").getOrThrow())
-        assertEquals(65536L, HexAddressParser.parse("0D65536").getOrThrow())
+    fun `a 0d style prefix is read as hexadecimal digits, never as decimal`() {
+        // "0D00" is a valid hex offset; reading it as decimal 0 would write at address 0.
+        assertEquals(0xD00L, HexAddressParser.parse("0D00").getOrThrow())
+        assertEquals(0xD1000L, HexAddressParser.parse("0d1000").getOrThrow())
     }
 
     @Test
@@ -37,14 +38,14 @@ class HexAddressParserTest {
         assertTrue(HexAddressParser.parse("").isFailure)
         assertTrue(HexAddressParser.parse("   ").isFailure)
         assertTrue(HexAddressParser.parse("0x").isFailure)
-        assertTrue(HexAddressParser.parse("0d").isFailure)
         assertTrue(HexAddressParser.parse("0xZZ").isFailure)
         assertTrue(HexAddressParser.parse("-0x10").isFailure)
-        assertTrue(HexAddressParser.parse("0d12AB").isFailure)
+        assertTrue(HexAddressParser.parse("0x12AB").isSuccess)
     }
 
     @Test
     fun `rejects addresses outside the 16 MB flash window`() {
+        assertTrue(HexAddressParser.parse("0x1000000").isFailure)
         assertTrue(HexAddressParser.parse("0x1000001").isFailure)
         assertTrue(HexAddressParser.parse("0xFFFFFFFF").isFailure)
         assertFalse(HexAddressParser.parse("0xFFFFFF").isFailure)

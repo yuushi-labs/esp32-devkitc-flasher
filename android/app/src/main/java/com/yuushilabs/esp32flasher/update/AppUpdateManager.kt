@@ -13,6 +13,8 @@ import com.yuushilabs.esp32flasher.core.UpdateOutcome
 import com.yuushilabs.esp32flasher.github.FirmwareReleaseClient
 import com.yuushilabs.esp32flasher.github.RepoRef
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 sealed interface UpdateStatus {
     data object UpToDate : UpdateStatus
@@ -80,10 +82,13 @@ class AppUpdateManager(
         onProgress: (bytesRead: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): File {
         val bytes = client.downloadAsset(asset, onProgress)
-        val directory = File(context.cacheDir, UPDATES_DIRECTORY).apply { mkdirs() }
         val fileName = asset.name.takeIf { it.endsWith(".apk", ignoreCase = true) }
             ?: "esp32-flasher-update.apk"
-        return File(directory, fileName).apply { writeBytes(bytes) }
+        // Writing a multi-megabyte APK must not run on the main thread.
+        return withContext(Dispatchers.IO) {
+            val directory = File(context.cacheDir, UPDATES_DIRECTORY).apply { mkdirs() }
+            File(directory, fileName).apply { writeBytes(bytes) }
+        }
     }
 
     fun canInstallPackages(): Boolean = context.packageManager.canRequestPackageInstalls()

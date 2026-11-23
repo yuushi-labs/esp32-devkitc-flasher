@@ -53,9 +53,11 @@ object UpdateDecision {
 
         val latestCode = latest.versionCode
         if (latestCode != null && check.currentVersionCode > 0) {
-            when {
-                latestCode > check.currentVersionCode -> return available(check, latest, "versionCode")
-                latestCode < check.currentVersionCode -> return UpdateOutcome.UpToDate
+            // versionCode is authoritative: an equal code is the same build, whatever the tag says.
+            return if (latestCode > check.currentVersionCode) {
+                available(check, latest, "versionCode")
+            } else {
+                UpdateOutcome.UpToDate
             }
         }
 

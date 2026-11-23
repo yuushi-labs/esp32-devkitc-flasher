@@ -132,11 +132,16 @@ fun SerialMonitorScreen(
                     ) {
                         Icon(Icons.Filled.RestartAlt, contentDescription = "リセット")
                     }
-                    IconButton(
-                        onClick = viewModel::toggleTimestamps,
-                        enabled = state.timestamps,
-                    ) {
-                        Icon(Icons.Filled.Schedule, contentDescription = "タイムスタンプ")
+                    IconButton(onClick = viewModel::toggleTimestamps) {
+                        Icon(
+                            Icons.Filled.Schedule,
+                            contentDescription = "タイムスタンプ",
+                            tint = if (state.timestamps) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
                     }
                     IconButton(onClick = viewModel::clear) {
                         Icon(Icons.Filled.Delete, contentDescription = "ログをクリア")

@@ -101,21 +101,21 @@ private object PinLists {
     ).withIds("L30-")
 
     val RIGHT_30: List<BoardPin> = listOf(
-        BoardPin("3V3", kind = BoardPinKind.POWER, note = "3.3V 出力"),
-        BoardPin("GND", kind = BoardPinKind.GROUND),
-        gpio(15),
-        gpio(2, "起動時に接続状態を出力"),
-        gpio(4),
-        gpio(16),
-        gpio(17),
-        gpio(5),
-        gpio(18),
-        gpio(19),
-        gpio(21),
-        gpio(3, "UART0 RX"),
-        gpio(1, "UART0 TX"),
-        gpio(22),
         gpio(23),
+        gpio(22),
+        gpio(1, "UART0 TX"),
+        gpio(3, "UART0 RX"),
+        gpio(21),
+        gpio(19),
+        gpio(18),
+        gpio(5),
+        gpio(17),
+        gpio(16),
+        gpio(4),
+        gpio(2, "起動時に接続状態を出力"),
+        gpio(15),
+        BoardPin("GND", kind = BoardPinKind.GROUND),
+        BoardPin("3V3", kind = BoardPinKind.POWER, note = "3.3V 出力"),
     ).withIds("R30-")
 }
 
@@ -136,9 +136,10 @@ object BoardPinout {
         if (gpio != null && isInputOnly(gpio)) {
             add("GPIO$gpio は入力専用です。出力や内部プルアップは使用できません。")
         }
-        when (pin.kind) {
-            BoardPinKind.POWER -> add("3.3V ロジックです。5V を直接入力すると破損します。")
-            BoardPinKind.ENABLE -> add("EN はアクティブ LOW のリセットです。")
+        when {
+            pin.label == "3V3" -> add("3.3V 出力ピンです。ここへ 5V を入力すると破損します。")
+            pin.label == "VIN" -> add("VIN は 5V 入力用です。3V3 や GPIO に 5V を入れないでください。")
+            pin.kind == BoardPinKind.ENABLE -> add("EN はアクティブ LOW のリセットです。")
             else -> Unit
         }
         pin.note?.let { add(it) }

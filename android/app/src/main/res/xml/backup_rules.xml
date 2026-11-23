@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 8-11 cloud backup. The Preferences DataStore holds the optional GitHub token, so the
+  whole app data directory stays out of backups: a token restored onto another device is a
+  credential leak the user never agreed to.
+-->
 <full-backup-content>
     <exclude
         domain="sharedpref"
+        path="." />
+    <exclude
+        domain="file"
         path="." />
 </full-backup-content>
