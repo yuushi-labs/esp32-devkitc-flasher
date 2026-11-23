@@ -221,7 +221,7 @@ class EspFlasherEngine(
         val accepted = try {
             val response = commandFrame(
                 EspCommands.CHANGE_BAUDRATE,
-                EspBootloaderProtocol.changeBaudFrame(newBaud, currentBaud),
+                EspBootloaderProtocol.changeBaudFrame(newBaud),
                 config.responseTimeoutMs,
             )
             requireOk(EspCommands.CHANGE_BAUDRATE, response)
@@ -243,7 +243,9 @@ class EspFlasherEngine(
             return false
         }
 
-        sleep(BAUD_SWITCH_DELAY_MS)
+        // Not the cancellable sleep(): once the ROM has accepted, the host switch and the recovery
+        // below have to run, or the two sides are left talking at different rates.
+        sleeper(BAUD_SWITCH_DELAY_MS)
         val switched = runCatching { link.setBaudRate(newBaud) }.isSuccess
         decoder.reset()
         pendingFrames.clear()
@@ -558,9 +560,12 @@ class EspFlasherEngine(
     private fun resetProtocolState() {
         decoder.reset()
         pendingFrames.clear()
+        runCatching { link.flushInput() }
+        // Only a DTR/RTS reset brings the ROM back to 115200; without it the link must stay at
+        // the rate the bootloader already accepted, so no re-sync is attempted there.
+        if (!config.autoReset) return
         isSynced = false
-        link.flushInput()
-        if (config.autoReset) performBootloaderReset()
+        performBootloaderReset()
         sync()
         isSynced = true
         // sync() dropped back to 115200; raise the link again so the retry keeps the fast rate.

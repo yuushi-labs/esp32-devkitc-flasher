@@ -39,12 +39,16 @@ class EspFlasherEngineTest {
         private val alwaysSilent: Boolean = false,
         private val rejectBaudChange: Boolean = false,
         private val ignoreBaudChange: Boolean = false,
+        private val loseBaudChangeReply: Boolean = false,
         private val failSwitchToBaud: Int? = null,
         private val silentAtBaud: Int? = null,
         initialBaudRate: Int = 115_200,
     ) : SerialLink {
         override var baudRate: Int = initialBaudRate
             private set
+
+        /** The rate the simulated ROM listens at; a reset brings it back to 115200. */
+        private var romBaudRate: Int = EspFlasherEngine.INITIAL_SYNC_BAUD
 
         val dtrRtsLog = mutableListOf<Pair<Boolean, Boolean>>()
         val commands = mutableListOf<Request>()
@@ -61,6 +65,9 @@ class EspFlasherEngineTest {
         private val pending = ArrayDeque<Byte>()
 
         override fun write(data: ByteArray) {
+            // The ROM only understands bytes sent at the rate it currently runs at, so a host that
+            // did not follow a CHANGE_BAUDRATE it accepted simply gets no answer.
+            if (baudRate != romBaudRate) return
             // A ROM that switched its UART but never answers there again.
             if (silentAtBaud != null && baudRate == silentAtBaud) return
             decoder.feed(data).forEach(::handleFrame)
@@ -76,6 +83,8 @@ class EspFlasherEngineTest {
 
         override fun setDtrRts(dtr: Boolean, rts: Boolean) {
             dtrRtsLog += dtr to rts
+            // Releasing both lines ends the reset pulse and the ROM boots at its default rate.
+            if (!dtr && !rts) romBaudRate = EspFlasherEngine.INITIAL_SYNC_BAUD
         }
 
         override fun setBaudRate(baudRate: Int) {
@@ -126,7 +135,12 @@ class EspFlasherEngineTest {
                         // The ROM ignores the request but keeps answering at the old rate.
                         ignoreBaudChange -> Unit
                         rejectBaudChange -> respond(op, status = 1, errorCode = 8)
-                        else -> respond(op)
+                        // The ROM switches but the confirmation never reaches the host.
+                        loseBaudChangeReply -> romBaudRate = request.u32(0).toInt()
+                        else -> {
+                            respond(op)
+                            romBaudRate = request.u32(0).toInt()
+                        }
                     }
                 }
 
@@ -249,9 +263,10 @@ class EspFlasherEngineTest {
     @Test
     fun `unparseable frames are skipped instead of failing the sequence`() {
         val device = FakeEspDevice(emitNoiseBeforeReplies = true)
-        val chip = engine(device).connect()
+        val engine = engine(device)
+        val chip = engine.connect()
         assertEquals("ESP32", chip.name)
-        val outcome = engine(device).flash(ByteArray(1024) { 3 }, 0x0)
+        val outcome = engine.flash(ByteArray(1024) { 3 }, 0x0)
         assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
     }
 
@@ -354,7 +369,12 @@ class EspFlasherEngineTest {
     fun `compressed flash falls back to uncompressed when deflate is rejected`() {
         val device = FakeEspDevice(failDeflatedBegin = true)
         val image = ByteArray(2048) { 0x11 }
-        val outcome = engine(device).flash(image, 0x10000)
+        val config = FlashConfig(
+            autoReset = true,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+        )
+        val outcome = engine(device, config).flash(image, 0x10000)
         assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
         assertFalse((outcome as FlashOutcome.Success).compressed)
         assertTrue(device.commands.any { it.op == EspCommands.FLASH_DEFL_BEGIN })
@@ -462,7 +482,7 @@ class EspFlasherEngineTest {
         val changeIndex = device.commands.indexOfFirst { it.op == EspCommands.CHANGE_BAUDRATE }
         assertTrue("CHANGE_BAUDRATE was not sent", changeIndex > chipReadIndex)
         assertEquals(460_800L, device.commands[changeIndex].u32(0))
-        assertEquals(115_200L, device.commands[changeIndex].u32(4))
+        assertEquals(0L, device.commands[changeIndex].u32(4))
         assertEquals(460_800, device.baudRate)
     }
 
@@ -522,7 +542,7 @@ class EspFlasherEngineTest {
         assertEquals(460_800, device.baudRate)
         val change = device.commands.first { it.op == EspCommands.CHANGE_BAUDRATE }
         assertEquals(460_800L, change.u32(0))
-        assertEquals(115_200L, change.u32(4))
+        assertEquals(0L, change.u32(4))
     }
 
     @Test
@@ -568,6 +588,35 @@ class EspFlasherEngineTest {
         assertFalse(engine.changeBaudRate(921_600, 460_800))
         assertEquals(115_200, device.baudRate)
         assertTrue(engine.isSynced)
+    }
+
+    @Test
+    fun `a lost baud change reply is detected and recovered`() {
+        val device = FakeEspDevice(loseBaudChangeReply = true)
+        val config = FlashConfig(
+            autoReset = true,
+            resetAfterFlash = false,
+            targetBaudRate = 460_800,
+            responseTimeoutMs = 50,
+        )
+        val outcome = engine(device, config).flash(ByteArray(1_024) { 4 }, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+        assertEquals(115_200, device.baudRate)
+        val dataIndex = device.commands.indexOfFirst { it.op == EspCommands.FLASH_DEFL_DATA }
+        assertEquals(115_200, device.baudAtCommand[dataIndex])
+    }
+
+    @Test
+    fun `a fallback without auto reset keeps the accepted rate instead of resyncing`() {
+        // With no DTR/RTS reset there is no way to bring the ROM back to 115200, so a fallback
+        // must not drop the link to a rate the bootloader no longer listens at.
+        val device = FakeEspDevice(failDeflatedBegin = true)
+        val image = ByteArray(2_048) { 0x11 }
+        val outcome = engine(device).flash(image, 0x10000)
+        assertTrue("unexpected outcome: $outcome", outcome is FlashOutcome.Success)
+        assertEquals(1, device.commands.count { it.op == EspCommands.SYNC })
+        val beginIndex = device.commands.indexOfFirst { it.op == EspCommands.FLASH_BEGIN }
+        assertEquals(460_800, device.baudAtCommand[beginIndex])
     }
 
     @Test

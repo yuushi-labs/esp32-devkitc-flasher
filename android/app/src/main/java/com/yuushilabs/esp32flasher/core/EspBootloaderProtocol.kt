@@ -221,8 +221,12 @@ object EspBootloaderProtocol {
 
     fun readRegFrame(address: Long): ByteArray = requestFrame(EspCommands.READ_REG, uint32(address))
 
-    fun changeBaudFrame(newBaud: Int, oldBaud: Int): ByteArray =
-        requestFrame(EspCommands.CHANGE_BAUDRATE, uint32(newBaud) + uint32(oldBaud))
+    /**
+     * CHANGE_BAUDRATE for the ROM bootloader. The ROM ignores the second word; esptool only fills
+     * it with the outgoing rate when it talks to the stub loader instead.
+     */
+    fun changeBaudFrame(newBaud: Int, oldBaudForStub: Int = 0): ByteArray =
+        requestFrame(EspCommands.CHANGE_BAUDRATE, uint32(newBaud) + uint32(oldBaudForStub))
 
     fun eraseFlashFrame(): ByteArray = requestFrame(EspCommands.ERASE_FLASH, uint32(0))
 
