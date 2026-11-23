@@ -56,7 +56,7 @@ android/
 - **Release 取得**:
   - `GET https://api.github.com/repos/{owner}/{repo}/releases`（および `releases/latest`）で公開 Release 一覧を取得。
   - Release 内の `flash-manifest.json` があればそれを優先解析して `merged`（`0x0000`）または `parts`（`0x10000` 等）を自動選択・SHA-256 検証。無い場合は `.bin` アセットを一覧表示してユーザーが選択・書き込みアドレスを指定できる。
-  - `flash-manifest.json` に `pins` 配列（各要素: `gpio`, `label`, `direction`, `activeLevel`, `note` 等、任意）が含まれる場合、Release 選択時・書き込み前後・専用「ピン配線ガイド」シート／画面で **「どの GPIO ピンに何を繋ぐか」** をカード一覧でわかりやすく表示する。さらに ESP32-DevKitC 標準の注意ピン（GPIO6〜11 は内蔵フラッシュ専用で使用不可、GPIO34〜39 は入力専用、3.3V / GND / VIN 電源注意）のリファレンスも参照できるようにする。
+  - `flash-manifest.json` に `pins` 配列（各要素: `gpio`, `label`, `direction`, `activeLevel`, `note` 等、任意）が含まれる場合、Release 選択時・書き込み前後・専用「ピン配線ガイド」シート／画面で **「どの GPIO ピンに何を繋ぐか」** をカード一覧でわかりやすく表示する。さらに **ESP32-DevKitC のボード図（トップビュー、30ピン / 38ピン切替対応）を Canvas でリアルに描画し、`pins` に含まれる GPIO ピンと対応する GND ピンに色付きの丸（ハイライト＋引き出しラベル）を正確なピン位置へ表示し、ピンをタップすると役割と配線注意点を確認できる** ようにする。あわせて ESP32-DevKitC 標準の注意ピン（GPIO6〜11 は内蔵フラッシュ専用で使用不可、GPIO34〜39 は入力専用、3.3V / GND / VIN 電源注意）のリファレンスも参照できるようにする。
 - **ローカル `.bin` 選択**:
   - SAF（`ActivityResultContracts.OpenDocument`）で `.bin` を読み込み、書き込み先アドレス（プリセット `0x0000 結合済み` / `0x10000 アプリ単体` / 任意入力）を選んで書き込み。
 
