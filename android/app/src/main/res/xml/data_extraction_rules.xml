@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ backup and device transfer. Settings (including an optional GitHub token) are kept
+  on the device and are not copied to the cloud or to another phone.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude
+            domain="sharedpref"
+            path="." />
+        <exclude
+            domain="file"
+            path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude
+            domain="sharedpref"
+            path="." />
+        <exclude
+            domain="file"
+            path="." />
+    </device-transfer>
+</data-extraction-rules>

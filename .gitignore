@@ -1,0 +1,14 @@
+# Gradle / Android
+.gradle/
+build/
+android/local.properties
+android/.kotlin/
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
