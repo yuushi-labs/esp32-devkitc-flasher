@@ -154,13 +154,13 @@ fun LogList(
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
                     entry.time,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, lineHeight = 16.sp),
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
                     entry.message,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 16.sp),
                     fontFamily = FontFamily.Monospace,
                     color = logColor(entry.level),
                 )

@@ -155,10 +155,11 @@ class EspBootloaderProtocolTest {
 
     @Test
     fun `change baud rate and erase commands encode arguments`() {
-        val change = parseRequest(EspBootloaderProtocol.changeBaudFrame(460800, 115200))
+        val change = parseRequest(EspBootloaderProtocol.changeBaudFrame(460800))
         assertEquals(EspCommands.CHANGE_BAUDRATE, change.op)
         assertEquals(460800L, readU32(change.payload, 0))
-        assertEquals(115200L, readU32(change.payload, 4))
+        // The ROM ignores the second word (esptool sends 0 unless it talks to the stub).
+        assertEquals(0L, readU32(change.payload, 4))
 
         val erase = parseRequest(EspBootloaderProtocol.eraseRegionFrame(0x10000, 0x1000))
         assertEquals(EspCommands.ERASE_REGION, erase.op)

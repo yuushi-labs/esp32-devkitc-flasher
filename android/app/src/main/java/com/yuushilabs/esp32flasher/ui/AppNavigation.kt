@@ -1,6 +1,7 @@
 package com.yuushilabs.esp32flasher.ui
 
 import android.app.Application
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Memory
@@ -73,6 +74,9 @@ fun Esp32FlasherRoot(container: AppContainer) {
     val currentRoute = backStackEntry?.destination?.route ?: Routes.FLASHER
 
     Scaffold(
+        // The window is edge-to-edge, so the IME inset is applied here instead of relying on
+        // adjustResize: the navigation bar and the content above it lift over the keyboard.
+        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
                 title = { Text(titleFor(currentRoute)) },

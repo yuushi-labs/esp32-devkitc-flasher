@@ -34,10 +34,16 @@ data class MonitorUiState(
     val newlineMode: NewlineMode = NewlineMode.LF,
     val timestamps: Boolean = true,
     val autoScroll: Boolean = true,
+    val sendHistory: List<String> = emptyList(),
     val connection: UsbSerialManager.ConnectionState = UsbSerialManager.ConnectionState.Disconnected,
     val message: String? = null,
 ) {
     val isConnected: Boolean get() = connection is UsbSerialManager.ConnectionState.Connected
+
+    /** The visible log as plain text, for the copy button. */
+    fun transcript(): String = lines.joinToString("\n") { line ->
+        if (timestamps && line.time.isNotEmpty()) "${line.time} ${line.text}" else line.text
+    }
 }
 
 /** Turns the raw byte stream of the shared USB port into monitor lines and sends commands. */
@@ -97,11 +103,18 @@ class MonitorViewModel(
     fun send() {
         val text = _state.value.input
         if (text.isBlank()) return
+        val command = text.trim()
         val payload = text.toByteArray() + _state.value.newlineMode.suffix
         val result = container.usbManager.write(payload)
         result.onSuccess {
             appendLocal("> $text", LogLevel.SUCCESS)
-            _state.update { it.copy(input = "") }
+            _state.update { current ->
+                current.copy(
+                    input = "",
+                    sendHistory = (listOf(command) + current.sendHistory.filterNot { it == command })
+                        .take(MAX_SEND_HISTORY),
+                )
+            }
         }.onFailure {
             appendLocal("送信に失敗しました: ${it.message}", LogLevel.ERROR)
             _state.update { it.copy(message = it.message ?: "送信に失敗しました") }
@@ -141,6 +154,10 @@ class MonitorViewModel(
 
     fun toggleAutoScroll() {
         _state.update { it.copy(autoScroll = !it.autoScroll) }
+    }
+
+    fun clearSendHistory() {
+        _state.update { it.copy(sendHistory = emptyList()) }
     }
 
     fun clear() {
@@ -210,5 +227,6 @@ class MonitorViewModel(
     private companion object {
         const val MAX_MONITOR_LINES = 2_000
         const val MAX_PARTIAL_LINE = 4_096
+        const val MAX_SEND_HISTORY = 8
     }
 }

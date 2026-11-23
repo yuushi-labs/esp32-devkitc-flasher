@@ -42,8 +42,11 @@ android/
    - `esptool.py` 互換のシーケンス（`DTR=false, RTS=true` → `DTR=true, RTS=false` → 短時間待機 → `DTR=false, RTS=false`）を実行する。
    - 自動リセットが効かないボード向けに「手動 BOOT ボタンを押しながらリセット」の案内とリトライボタンも用意する。
 2. **SYNC とチップ確認**:
+   - 同期は常に `115200` bps（`EspFlasherEngine.INITIAL_SYNC_BAUD`）で行う。USB ポートを高速ボーレートで開いていても、`SYNC` 送信前に必ず `115200` へ戻す（再同期・圧縮フォールバック後の再 SYNC も同様）。
    - `SYNC`（`0x08`）を複数回送信して同期確立。
-   - `READ_REG` 等でチップ種別・MAC アドレスを読み取り UI に表示。
+   - `READ_REG` 等でチップ種別・MAC アドレスを読み取り UI に表示（チップ情報の取得も `115200` で行う）。
+   - チップ情報取得後に `CHANGE_BAUDRATE`（`0x0F`）で `FlashConfig.targetBaudRate`（既定 `460800`）へ切り替える。切り替えに失敗した場合は `115200` のまま安全に書き込みを続行する。
+   - USB ポートは `115200` でオープンし、書き込み終了後は `endExclusiveAccess` でシリアルモニターのボーレートへ戻す。
 3. **フラッシュ書き込み**:
    - `SPI_ATTACH`（`0x0D`）で内蔵 SPI フラッシュを有効化。
    - 高速化のため `FLASH_DEFL_BEGIN`（`0x10`）/ `FLASH_DEFL_DATA`（`0x11`）/ `FLASH_DEFL_END`（`0x12`）による zlib 圧縮書き込みを基本とし、必要に応じ非圧縮（`FLASH_BEGIN` `0x02` / `FLASH_DATA` `0x03` / `FLASH_END` `0x04`）もサポート。
@@ -72,4 +75,4 @@ android/
 - JVM ユニットテスト（SLIP、ESP ブートローダーコマンド構築・応答・圧縮分割、Manifest 解析、Hex アドレス、UpdateDecision）全通過
 - `./gradlew lintDebug` エラー 0
 - `./gradlew assembleRelease` 成功 + `apksigner verify` 通過
-- タグ `v0.1.0` 作成＋GitHub Release 公開（`esp32-devkitc-flasher-v0.1.0.apk` 添付）
+- タグ `v0.1.1` 作成＋GitHub Release 公開（`esp32-devkitc-flasher-v0.1.1.apk` 添付、`versionCode: 2`）
