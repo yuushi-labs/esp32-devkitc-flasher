@@ -1,7 +1,6 @@
 package com.yuushilabs.esp32flasher.core
 
 import java.security.MessageDigest
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -142,7 +141,6 @@ class PartitionTableParserTest {
         table.fill(0xFF.toByte(), 64, 96)
         val parsed = PartitionTableParser.parseTableImage(table)
         assertEquals(2, parsed.entries.size)
-        assertArrayEquals(PartitionTableParser.md5(table, 0, 64), PartitionTableParser.md5(table, 0, 64))
     }
 
     @Test

@@ -40,7 +40,6 @@ import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -120,7 +119,6 @@ class LittleFsViewModel(
     @Volatile
     private var cancelRequested = false
 
-    private var job: Job? = null
     private var stub: EspStub? = null
     private var lastImage: ByteArray? = null
 
@@ -154,6 +152,11 @@ class LittleFsViewModel(
     }
 
     fun selectPreset(preset: LittleFsPartitionPreset) {
+        if (preset == LittleFsPartitionPreset.CUSTOM) {
+            // Keep the values the user already has; the custom fields stay editable as they are.
+            _state.update { it.copy(preset = preset) }
+            return
+        }
         _state.update {
             it.copy(
                 preset = preset,
@@ -605,7 +608,7 @@ class LittleFsViewModel(
         if (_state.value.busy) return
         cancelRequested = false
         _state.update { it.copy(busy = true, progress = 0f, speedKbps = 0) }
-        job = viewModelScope.launch {
+        viewModelScope.launch {
             try {
                 block()
             } catch (error: LittleFsCapacityException) {
@@ -644,9 +647,26 @@ class LittleFsViewModel(
 
     private fun readFiles(files: List<PickedFile>): List<LittleFsFile> {
         val resolver = getApplication<Application>().contentResolver
+        val limit = _state.value.partitionSize ?: MAX_PARTITION_BYTES
         return files.map { picked ->
-            val bytes = resolver.openInputStream(picked.uri)?.use { it.readBytes() }
-                ?: throw IOException("${picked.path} を開けませんでした")
+            if (picked.sizeBytes > limit) {
+                throw IOException("${picked.path} がパーティションより大きいため読み込めません")
+            }
+            val bytes = resolver.openInputStream(picked.uri)?.use { stream ->
+                val buffer = java.io.ByteArrayOutputStream(picked.sizeBytes.toInt().coerceAtLeast(64))
+                val chunk = ByteArray(64 * 1024)
+                var total = 0
+                while (true) {
+                    val read = stream.read(chunk)
+                    if (read < 0) break
+                    total += read
+                    if (total > limit) {
+                        throw IOException("${picked.path} がパーティションサイズを超えています")
+                    }
+                    buffer.write(chunk, 0, read)
+                }
+                buffer.toByteArray()
+            } ?: throw IOException("${picked.path} を開けませんでした")
             LittleFsFile(picked.path, bytes)
         }
     }
@@ -761,6 +781,7 @@ class LittleFsViewModel(
         const val PREVIEW_LIMIT = 64 * 1024
         const val MAX_FOLDER_DEPTH = 12
         const val DEFAULT_FLASH_BYTES = 4L * 1024 * 1024
+        const val MAX_PARTITION_BYTES = 16 * 1024 * 1024
         const val MAX_FLASH_BYTES = 16L * 1024 * 1024
     }
 }

@@ -273,6 +273,12 @@ class EspFlasherEngine(
             stubRunning -> true
             stub != null -> runCatching { uploadStub(stub) }.getOrElse { error ->
                 listener.onLog("スタブの書き込みに失敗しました: ${error.message}")
+                // A half-finished RAM upload leaves the ROM in download mode, so bring it back to
+                // a known state before the slow read is attempted.
+                if (config.autoReset) {
+                    listener.onLog("ESP32 をリセットして ROM の読み出しに切り替えます")
+                    runCatching { recoverAtSyncRate(link.baudRate) }
+                }
                 false
             }
             else -> false
