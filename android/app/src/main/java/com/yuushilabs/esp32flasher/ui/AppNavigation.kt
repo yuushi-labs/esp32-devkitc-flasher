@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
@@ -36,6 +37,7 @@ import com.yuushilabs.esp32flasher.AppContainer
 
 object Routes {
     const val FLASHER = "flasher"
+    const val LITTLEFS = "littlefs"
     const val MONITOR = "monitor"
     const val SETTINGS = "settings"
 }
@@ -48,6 +50,9 @@ class AppViewModelFactory(
     override fun <T : ViewModel> create(modelClass: Class<T>): T = when {
         modelClass.isAssignableFrom(FlasherViewModel::class.java) ->
             FlasherViewModel(application, container)
+
+        modelClass.isAssignableFrom(LittleFsViewModel::class.java) ->
+            LittleFsViewModel(application, container)
 
         modelClass.isAssignableFrom(MonitorViewModel::class.java) ->
             MonitorViewModel(application, container)
@@ -65,6 +70,7 @@ fun Esp32FlasherRoot(container: AppContainer) {
     val application = LocalContext.current.applicationContext as Application
     val factory = remember(container, application) { AppViewModelFactory(application, container) }
     val flasherViewModel: FlasherViewModel = viewModel(factory = factory)
+    val littleFsViewModel: LittleFsViewModel = viewModel(factory = factory)
     val monitorViewModel: MonitorViewModel = viewModel(factory = factory)
     val settingsViewModel: SettingsViewModel = viewModel(factory = factory)
 
@@ -109,6 +115,13 @@ fun Esp32FlasherRoot(container: AppContainer) {
                     onOpenMonitor = { navController.navigateSingleTop(Routes.MONITOR) },
                 )
             }
+            composable(Routes.LITTLEFS) {
+                LittleFsScreen(
+                    viewModel = littleFsViewModel,
+                    flasherViewModel = flasherViewModel,
+                    snackbarHostState = snackbarHostState,
+                )
+            }
             composable(Routes.MONITOR) {
                 SerialMonitorScreen(monitorViewModel, snackbarHostState)
             }
@@ -125,11 +138,13 @@ private enum class BottomDestination(
     val icon: ImageVector,
 ) {
     FLASHER(Routes.FLASHER, "書き込み", Icons.Filled.Memory),
+    LITTLEFS(Routes.LITTLEFS, "LittleFS", Icons.Filled.Folder),
     MONITOR(Routes.MONITOR, "モニター", Icons.Filled.Terminal),
     SETTINGS(Routes.SETTINGS, "設定", Icons.Filled.Settings),
 }
 
 private fun titleFor(route: String): String = when (route) {
+    Routes.LITTLEFS -> "LittleFS / データ吸い出し"
     Routes.MONITOR -> "シリアルモニター"
     Routes.SETTINGS -> "設定"
     else -> "ESP32 Flasher"

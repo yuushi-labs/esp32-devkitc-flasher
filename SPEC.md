@@ -18,11 +18,18 @@ android/
 │   │   ├── SlipCodec.kt              # SLIP フレームエンコード/デコード
 │   │   ├── EspBootloaderProtocol.kt  # ESP32 ROM ブートローダーコマンド構築・応答解析・zlib圧縮ブロック分割
 │   │   ├── FlashManifestParser.kt    # flash-manifest.json と GitHub Release アセット解析
-│   │   ├── HexAddressParser.kt       # 0x0000 / 0x10000 等のアドレス検証
-│   │   └── UpdateDecision.kt         # アプリ自己アップデート判定（ETag/versionCode/semver）
+│   │   ├── HexAddressParser.kt       # アドレス検証とプリセット（結合済み/ブートローダー/パーティション/OTADATA/アプリ/LittleFS）
+│   │   ├── UpdateDecision.kt         # アプリ自己アップデート判定（ETag/versionCode/semver）
+│   │   ├── PartitionTableParser.kt   # 0x8000 の ESP32 パーティションテーブル（32 バイトエントリ + MD5）解析
+│   │   ├── LittleFsFormat.kt         # littlefs v2.1 のタグ・CRC-32・CTZ 幾何・LE ヘルパー
+│   │   ├── LittleFsImageBuilder.kt   # 純 Kotlin の littlefs v2.1 イメージ生成
+│   │   ├── LittleFsReader.kt         # 純 Kotlin の littlefs v2.1 読み取り（一覧・内容・CTZ）
+│   │   ├── LittleFsPartitionPreset.kt# default.csv / min_spiffs.csv / カスタム
+│   │   └── EspStub.kt                # Espressif スタブフラッシャーの JSON 解析
 │   ├── usb/
 │   │   ├── UsbSerialTransport.kt     # usb-serial-for-android ラッパー、DTR/RTS ブートシーケンス、ボーレート変更
 │   │   └── EspFlasherEngine.kt       # SYNC → SPI_ATTACH → FLASH_BEGIN/DATA/END（圧縮/非圧縮）→ リセット
+│   │                                 #   スタブ書き込み（MEM_BEGIN/DATA/END）と READ_FLASH / READ_FLASH_SLOW も担当
 │   ├── github/
 │   │   └── FirmwareReleaseClient.kt  # GitHub Releases API 取得・キャッシュ・.bin ダウンロード（SHA-256 検証）
 │   ├── data/
@@ -31,6 +38,8 @@ android/
 │   │   └── AppUpdateManager.kt       # 本アプリ自身の GitHub Releases 自動アップデート
 │   └── ui/
 │       ├── FlasherScreen.kt          # USB接続状態・GitHub Release取得・ローカル.bin選択・書き込み進捗
+│       ├── LittleFsScreen.kt         # パーティション・ファイル登録・生成/書き込み・ESP32 読み出し・プレビュー
+│       ├── LittleFsViewModel.kt      # LittleFS モードの状態管理（SAF、生成、読み出し、保存）
 │       ├── SerialMonitorScreen.kt    # シリアルログ・送信・ボーレート・リセットボタン
 │       └── SettingsScreen.kt         # 連携リポジトリ設定・OPPO OTG ガイド・アプリ更新情報
 └── keystore/
@@ -63,6 +72,40 @@ android/
 - **ローカル `.bin` 選択**:
   - SAF（`ActivityResultContracts.OpenDocument`）で `.bin` を読み込み、書き込み先アドレス（プリセット `0x0000 結合済み` / `0x10000 アプリ単体` / 任意入力）を選んで書き込み。
 
+## 5.5 LittleFS 対応（v0.2.0）
+
+この環境には Android NDK がないため、littlefs の C 実装をビルドせずに **同じディスクフォーマットを純 Kotlin で読み書きする**。
+
+### 5.5.1 イメージ生成（`LittleFsImageBuilder`）
+- 対象は littlefs **v2.1**（`LFS_DISK_VERSION = 0x00020001`、esp_littlefs / Arduino-ESP32 / PlatformIO と同じ）。
+- スーパーブロック: `"littlefs"` マジック + `version / block_size / block_count / name_max / file_max / attr_max`（24 バイト）。`block_size = 4096`、`block_count = パーティションサイズ / 4096`、`name_max = 32`（mklittlefs と同じ控えめな値。esp_littlefs の `LFS_NAME_MAX=255` でも 32 は受け入れられる）、`file_max = 0x7FFFFFFF`、`attr_max = 1022`。
+- レイアウト: ブロック 0/1 がルートの metadata pair（スーパーブロック + ルートのエントリ）。以降はサブディレクトリごとに 2 ブロックの pair、最後に大きなファイルの CTZ データブロック。
+- metadata ブロックは littlefs のコンパクションと同じ 1 コミット構成: リビジョン（LE 32bit）→ 各エントリのタグ（big-endian で前タグと XOR）→ ブロック末尾まで埋める CRC タグ（データ部 1022 バイトずつに分割）。
+- エントリは `NAME`（型 1=REG / 2=DIR）+ 続く `INLINESTRUCT`（256 バイト以下）/ `CTZSTRUCT`（head + size）/ `DIRSTRUCT`（pair）。名前は UTF-8 バイト順に並べる（littlefs と同じ比較）。
+- 1 ブロックに収まらないディレクトリは `HARDTAIL (0x601)` で複数の pair に分割し、2 つ目以降の pair の id は 0 から振り直す（littlefs の `lfs_dir_split` と同じ）。
+- 大きいファイルは CTZ skip-list（`block_size - 8` ストライド、`ctz(index)+1` 本のポインタ）で書き、リンクを末尾から先頭へたどるため **末尾のデータブロックを head** として `CTZSTRUCT`（head + size）に格納する。
+- CRC は littlefs の `lfs_crc`（多項式 `0x04c11db7` のリフレクテッド 16 エントリ表、初期値 `0xffffffff`）。
+
+### 5.5.2 読み取り（`LittleFsReader`）
+- metadata pair は 2 ブロックのうち**有効なコミットを持つ新しいリビジョン**を採用し、CRC タグで区切られたコミットを順に再生する（後続コミットが上書き、`CREATE`/`DELETE` スプライスで id を詰め替え）。
+- ディレクトリは `HARDTAIL` チェーンをたどって全ブロックを結合し、`SOFTTAIL`（メタデータスレッド）は一覧に含めない。ルートはスーパーブロックを持つ最後の pair。
+- ファイルは inline データ、または `CTZSTRUCT` の head/size から `lfs_ctz_find` と同じ手順でブロックをたどって読み出す。
+- 日本語ファイル名は UTF-8 バイト列としてそのまま扱う。
+
+### 5.5.3 ESP32 からの読み出し
+- **ROM ブートローダーには `READ_FLASH (0xD2)` が実装されていない**（stub 専用）。そこで first に Espressif のスタブフラッシャー（`esp-flasher-stub v1.4.1`、`assets/esp32-stub-flasher.json`、Apache-2.0 / MIT）を `MEM_BEGIN (0x05)` → `MEM_DATA (0x07)` → `MEM_END (0x06)` で RAM に書き込み、`OHAI` を待ってから `READ_FLASH` を使う。
+  - `READ_FLASH` は 64 KB 単位。スタブは 4 KB ごとの SLIP フレームで返し、各フレーム後に**累計受信バイト数（4 バイト LE）**を返す必要がある。最後に 16 バイトの MD5 が来るので必ず照合する。
+- スタブの起動を確認できない場合は **ROM の `READ_FLASH_SLOW (0x0E)`** にフォールバックする（64 バイト/コマンド、`SPI_SET_PARAMS` でフラッシュサイズを設定）。遅いが ESP32 の ROM 単体でも確実に動く経路。
+- まず `0x8000` の 4 KB を読んで `PartitionTableParser` でテーブルを解析（`0xAA50` マジック、32 バイトエントリ、末尾の `0xEBEB` MD5 を検証）。`littlefs (0x83)` / `spiffs (0x82)` / `fat (0x81)` を検出し、`littlefs` を優先して読み出す。読み取り不可・カスタム時はプリセット／手入力にフォールバック。
+- 読み出したイメージは `LittleFsReader` で一覧化し、テキストプレビュー・1 ファイル保存・ZIP 一括保存・`.bin` 保存に対応。
+
+### 5.5.4 検証
+- `littlefs-python`（参照実装）との相互運用テスト（`LittleFsInteropScriptTest` と `tools/littlefs_interop.py`）:
+  - `LittleFsImageBuilder` が生成したイメージ（空 / 単一 / ネスト / 日本語 / CTZ 大ファイル / ルート分割する 150 ファイル）を littlefs-python がマウントし、内容が 1 バイトも違わないこと
+  - littlefs-python が生成したイメージを `LittleFsReader` が 1 バイトも違わず読めること
+- 参照実装が作ったイメージを `app/src/test/resources/littlefs/` に固定し、Python が無い環境でも `LittleFsFixtureTest` が常に検証する。
+- プロトコル層は `EspFlasherEngineReadTest` が esptool と同じ応答モデル（64 バイトの `READ_FLASH_SLOW`、4 KB フレーム + 累計 ACK + MD5 の `READ_FLASH`）で検証する。**実機での確認はユーザーの ESP32-DevKitC で行う必要がある**。
+
 ## 6. 権限と OPPO（ColorOS）配慮
 - 不要な権限は要求しない（`INTERNET`, `REQUEST_INSTALL_PACKAGES` のみ。USB Host は `uses-feature android.hardware.usb.host` `required="false"` と `USB_DEVICE_ATTACHED` / 実行時 `UsbManager.requestPermission` で対応）。
 - OPPO / ColorOS 端末では設定の「OTG 接続」がオフだと USB デバイスが見えないことがあるため、未検出時の案内カードに設定手順を表示する。
@@ -75,4 +118,5 @@ android/
 - JVM ユニットテスト（SLIP、ESP ブートローダーコマンド構築・応答・圧縮分割、Manifest 解析、Hex アドレス、UpdateDecision）全通過
 - `./gradlew lintDebug` エラー 0
 - `./gradlew assembleRelease` 成功 + `apksigner verify` 通過
-- タグ `v0.1.1` 作成＋GitHub Release 公開（`esp32-devkitc-flasher-v0.1.1.apk` 添付、`versionCode: 2`）
+- LittleFS の相互運用テスト（littlefs-python 双方向）全通過
+- タグ `v0.2.0` 作成＋GitHub Release 公開（`esp32-devkitc-flasher-v0.2.0.apk` 添付、`versionCode: 3`）

@@ -1,12 +1,27 @@
 package com.yuushilabs.esp32flasher.core
 
 /** Well known flash offsets offered by the UI. */
-enum class AddressPreset(val address: Long) {
+enum class AddressPreset(val address: Long, val label: String) {
     /** A merged image that already contains bootloader, partition table and application. */
-    MERGED(0x0000L),
+    MERGED(0x0000L, "結合済み"),
+
+    /** Second stage bootloader of the default partition table. */
+    BOOTLOADER(0x1000L, "ブートローダー"),
+
+    /** Partition table of the default partition table. */
+    PARTITION_TABLE(0x8000L, "パーティションテーブル"),
+
+    /** `otadata` of an ESP32 (Arduino) layout. */
+    OTA_DATA(0xE000L, "OTADATA"),
 
     /** An application image written right after the default partition table. */
-    APP(0x10000L),
+    APP(0x10000L, "アプリ単体"),
+
+    /** `spiffs`/`littlefs` data partition of the Arduino `default.csv` 4 MB layout. */
+    LITTLEFS_DEFAULT(0x290000L, "LittleFS (4MB default)"),
+
+    /** Data partition of the Arduino `min_spiffs.csv` 4 MB layout. */
+    LITTLEFS_MIN_SPIFFS(0x3D0000L, "LittleFS (min_spiffs)"),
 }
 
 /**

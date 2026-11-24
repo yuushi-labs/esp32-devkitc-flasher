@@ -1,0 +1,11 @@
+littlefs-python-empty	littlefs-python-empty.bin
+littlefs-python-mixed	littlefs-python-mixed.bin
+  docs/memo.txt	dddc2b3294ece9351b5851a643c07501c36dab7257c96f6e481a2bbceba68bb4
+  docs/sub/data.bin	43f9b5d59eb108817176c6f65c2c6203a22f2ae8bc28b7a1dde45947678c5042
+  docs/sub/deep.txt	74611c1d6455b534323a21f8133a6f43dc3a8188e7b946f96dcc28dde932fcb2
+  empty.txt	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  hello.txt	c6c094deab8cedad5e7cb1d5b7a40d51126ecba945481fec4d6e7d9b7a11cef7
+  フォルダ/メモ.txt	a4923a3fd23d16fee511904e893a8581a88191c4dbf475762b80a5cf86daeb27
+  日本語.txt	81cf0fb2f41dab4e93c086815bc082140642d0efa1155398597a823c232bf4fa
+littlefs-python-big	littlefs-python-big.bin
+  big.bin	ebddb17d90ee6f7f5e8e60a9569be22b2baeafd8304bd6164aeff12a6a4e2bb4

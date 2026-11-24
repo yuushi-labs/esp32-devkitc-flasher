@@ -16,11 +16,14 @@ object EspCommands {
     const val READ_REG = 0x0A
     const val SPI_SET_PARAMS = 0x0B
     const val SPI_ATTACH = 0x0D
+    /** ROM-only flash read; the ROM answers 64 bytes per command (ESP32 supports this). */
+    const val READ_FLASH_SLOW = 0x0E
     const val CHANGE_BAUDRATE = 0x0F
     const val FLASH_DEFL_BEGIN = 0x10
     const val FLASH_DEFL_DATA = 0x11
     const val FLASH_DEFL_END = 0x12
     const val GET_SECURITY_INFO = 0x14
+    /** Stub-loader only: reads a whole block at a time and ends with an MD5 digest. */
     const val ERASE_FLASH = 0xD0
     const val ERASE_REGION = 0xD1
     const val READ_FLASH = 0xD2
@@ -91,6 +94,18 @@ object EspBootloaderProtocol {
     const val BLOCK_SIZE = 0x400
     const val SECTOR_SIZE = 0x1000
     const val FLASH_BLOCK_SIZE = 0x10000
+
+    /** Block size esptool uses when copying the stub flasher into RAM. */
+    const val RAM_BLOCK_SIZE = 0x1800
+
+    /** Payload size the stub flasher sends per read frame (esptool's `FLASH_SECTOR_SIZE`). */
+    const val READ_BLOCK_SIZE = 0x1000
+
+    /**
+     * How many packets the stub may send before an acknowledgement. esptool sends 64 here; the
+     * stub (esp-flasher-stub v1.4.1) waits for an ack after every packet regardless.
+     */
+    const val READ_UNCONFIRMED_PACKETS = 64
     const val PAGE_SIZE = 0x100
     const val DEFAULT_STATUS_MASK = 0xFFFF
     const val COMPRESSION_LEVEL = 9
@@ -183,7 +198,14 @@ object EspBootloaderProtocol {
 
     fun syncFrame(): ByteArray = requestFrame(EspCommands.SYNC, syncPayload())
 
-    fun spiAttachFrame(): ByteArray = requestFrame(EspCommands.SPI_ATTACH, uint32(0) + uint32(0))
+    /**
+     * `SPI_ATTACH` (0x0D). The ROM accepts a word describing the SPI pins (0 = the default flash
+     * wiring); the stub only reads the first word and works with the short form esptool sends.
+     */
+    fun spiAttachFrame(payloadBytes: Int = 8): ByteArray = requestFrame(
+        EspCommands.SPI_ATTACH,
+        if (payloadBytes >= 8) uint32(0) + uint32(0) else uint32(0),
+    )
 
     fun spiSetParamsFrame(
         totalSize: Int = 0x400000,
@@ -227,6 +249,51 @@ object EspBootloaderProtocol {
      */
     fun changeBaudFrame(newBaud: Int, oldBaudForStub: Int = 0): ByteArray =
         requestFrame(EspCommands.CHANGE_BAUDRATE, uint32(newBaud) + uint32(oldBaudForStub))
+
+    /**
+     * `READ_FLASH` (0xD2) — only the stub flasher implements it; a bare ESP32 ROM does not.
+     * The stub answers with one SLIP frame per [blockSize] bytes, expects a 4 byte acknowledgement
+     * of the received length after each frame, and finishes with the MD5 of the whole read.
+     */
+    fun readFlashFrame(
+        offset: Long,
+        size: Int,
+        packetSize: Int = READ_BLOCK_SIZE,
+        maxUnconfirmedPackets: Int = READ_UNCONFIRMED_PACKETS,
+    ): ByteArray = requestFrame(
+        EspCommands.READ_FLASH,
+        uint32(offset) + uint32(size) + uint32(packetSize) + uint32(maxUnconfirmedPackets),
+    )
+
+    /** `READ_FLASH_SLOW` (0x0E) — the ESP32 ROM reads at most 64 bytes per command. */
+    fun readFlashSlowFrame(offset: Long, blockLength: Int): ByteArray = requestFrame(
+        EspCommands.READ_FLASH_SLOW,
+        uint32(offset) + uint32(blockLength),
+    )
+
+    /** `MEM_BEGIN` (0x05): start a RAM download of [size] bytes in [blockCount] blocks. */
+    fun memBeginFrame(
+        size: Int,
+        blockCount: Int,
+        blockSize: Int = RAM_BLOCK_SIZE,
+        offset: Long,
+    ): ByteArray = requestFrame(
+        EspCommands.MEM_BEGIN,
+        uint32(size) + uint32(blockCount) + uint32(blockSize) + uint32(offset),
+    )
+
+    /** `MEM_DATA` (0x07): one block of a RAM download. */
+    fun memDataFrame(chunk: ByteArray, sequence: Int): ByteArray = requestFrame(
+        EspCommands.MEM_DATA,
+        uint32(chunk.size) + uint32(sequence) + uint32(0) + uint32(0) + chunk,
+        checksum(chunk),
+    )
+
+    /** `MEM_END` (0x06): leave the RAM download and jump to [entryPoint]. */
+    fun memEndFrame(entryPoint: Long, stayInLoader: Boolean = false): ByteArray = requestFrame(
+        EspCommands.MEM_END,
+        uint32(if (stayInLoader) 1 else 0) + uint32(entryPoint),
+    )
 
     fun eraseFlashFrame(): ByteArray = requestFrame(EspCommands.ERASE_FLASH, uint32(0))
 
@@ -278,6 +345,8 @@ object EspBootloaderProtocol {
             deflater.end()
         }
     }
+
+    fun uint32Bytes(value: Long): ByteArray = uint32(value)
 
     fun split(data: ByteArray, chunkSize: Int = BLOCK_SIZE): List<ByteArray> {
         require(chunkSize > 0) { "チャンクサイズは 1 バイト以上である必要があります" }
