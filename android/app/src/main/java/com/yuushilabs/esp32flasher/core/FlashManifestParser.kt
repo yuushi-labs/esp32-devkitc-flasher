@@ -21,6 +21,26 @@ data class FlashImage(
     val addressLabel: String get() = HexAddressParser.format(address)
 }
 
+/**
+ * A filesystem image documented in `flash-manifest.json`, e.g.
+ * `{"type": "littlefs", "offset": "0x290000", "size": "0x160000", "asset": "littlefs.bin"}`.
+ *
+ * Firmware releases ship these next to the application so the app can flash the application and
+ * the data partition together, or only the data partition.
+ */
+data class FilesystemImage(
+    val type: String,
+    val fileName: String,
+    val address: Long,
+    val sizeBytes: Long? = null,
+    val sha256: String? = null,
+    val downloadUrl: String? = null,
+) {
+    val isLittleFs: Boolean get() = type.equals("littlefs", ignoreCase = true)
+    val isSpiffs: Boolean get() = type.equals("spiffs", ignoreCase = true)
+    val addressLabel: String get() = HexAddressParser.format(address)
+}
+
 /** Direction of a pin as documented by the firmware manifest. */
 enum class PinDirection { INPUT, OUTPUT, BIDIRECTIONAL, UNKNOWN }
 
@@ -49,13 +69,27 @@ data class FlashManifest(
     val notes: String? = null,
     val merged: FlashImage? = null,
     val parts: List<FlashImage> = emptyList(),
+    val filesystems: List<FilesystemImage> = emptyList(),
     val pins: List<PinAssignment> = emptyList(),
     val wiringNotes: List<String> = emptyList(),
     val powerNote: String? = null,
 ) {
     val allImages: List<FlashImage> get() = listOfNotNull(merged) + parts
 
-    val isEmpty: Boolean get() = allImages.isEmpty()
+    /** Images to flash for this release: the firmware plus any filesystems it ships. */
+    val flashableImages: List<FlashImage>
+        get() = allImages + filesystems.map { fs ->
+            FlashImage(
+                name = fs.type,
+                fileName = fs.fileName,
+                address = fs.address,
+                sizeBytes = fs.sizeBytes,
+                sha256 = fs.sha256,
+                downloadUrl = fs.downloadUrl,
+            )
+        }
+
+    val isEmpty: Boolean get() = allImages.isEmpty() && filesystems.isEmpty()
 
     val hasWiringGuide: Boolean
         get() = pins.isNotEmpty() || wiringNotes.isNotEmpty() || !powerNote.isNullOrBlank()
@@ -154,7 +188,8 @@ object FlashManifestParser {
                 parts += parseImage(element, "part[$index]")
             }
         }
-        if (merged == null && parts.isEmpty()) {
+        val filesystems = parseFilesystems(obj)
+        if (merged == null && parts.isEmpty() && filesystems.isEmpty()) {
             throw ManifestFormatException("flash-manifest.json に書き込み対象のイメージがありません")
         }
         return FlashManifest(
@@ -164,10 +199,48 @@ object FlashManifestParser {
             notes = obj.str("notes", "release_notes", "description"),
             merged = merged,
             parts = parts,
+            filesystems = filesystems,
             pins = parsePins(obj),
             wiringNotes = parseWiringNotes(obj),
             powerNote = obj.str("powerNote", "power_note", "powerHint", "power_hint"),
         )
+    }
+
+    /**
+     * Reads the `filesystems` array. Each entry names its type and asset; when the offset is
+     * missing the ESP32 default layout is assumed for that type, so a manifest only has to say
+     * `{"type": "littlefs", "asset": "littlefs.bin"}`.
+     */
+    private fun parseFilesystems(obj: JsonObject): List<FilesystemImage> {
+        val array = obj["filesystems"] as? JsonArray
+            ?: obj["filesystem"] as? JsonArray
+            ?: return emptyList()
+        return array.mapNotNull { element ->
+            val entry = element as? JsonObject ?: return@mapNotNull null
+            val type = entry.str("type", "fs", "kind", "filesystem")
+                ?: if (entry.str(*FILE_KEYS)?.contains("spiffs", ignoreCase = true) == true) {
+                    "spiffs"
+                } else {
+                    "littlefs"
+                }
+            val fileName = entry.str(*FILE_KEYS, "asset")?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            val address = entry.num(*ADDRESS_KEYS) ?: defaultFilesystemOffset(type)
+            FilesystemImage(
+                type = type.lowercase(),
+                fileName = fileName,
+                address = address,
+                sizeBytes = entry.num(*SIZE_KEYS),
+                sha256 = entry.str(*SHA_KEYS)?.normalizeSha(),
+                downloadUrl = entry.str(*URL_KEYS),
+            )
+        }
+    }
+
+    /** ESP32 Arduino partition layout defaults for a filesystem image without an offset. */
+    fun defaultFilesystemOffset(type: String): Long = when (type.lowercase()) {
+        "spiffs", "littlefs", "fat" -> AddressPreset.LITTLEFS_DEFAULT.address
+        else -> AddressPreset.LITTLEFS_DEFAULT.address
     }
 
     private fun parsePins(obj: JsonObject): List<PinAssignment> {
@@ -342,6 +415,9 @@ object FlashManifestParser {
             else -> null
         }
     }
+
+    /** The filesystem images of a release (littlefs / spiffs), in manifest order. */
+    fun selectFilesystems(manifest: FlashManifest): List<FilesystemImage> = manifest.filesystems
 
     fun selectImages(manifest: FlashManifest, preferMerged: Boolean = true): List<FlashImage> {
         if (preferMerged) {

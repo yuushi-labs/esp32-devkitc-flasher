@@ -325,6 +325,55 @@ private fun FirmwareCard(
                     }
                 }
             }
+            if (manifest.filesystems.isNotEmpty()) {
+                Text("データ用イメージ (LittleFS / SPIFFS)", style = MaterialTheme.typography.labelLarge)
+                manifest.filesystems.forEach { filesystem ->
+                    val selected = (state.selection as? FirmwareSelection.ReleaseImage)
+                        ?.image?.fileName == filesystem.fileName
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "${filesystem.type} / ${filesystem.fileName}",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                "${filesystem.addressLabel}" +
+                                    (filesystem.sizeBytes?.let { " / $it bytes" } ?: ""),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (selected) {
+                            Icon(
+                                Icons.Filled.CheckCircle,
+                                contentDescription = "選択中",
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        } else {
+                            TextButton(
+                                onClick = {
+                                    onSelectImage(
+                                        release,
+                                        FlashImage(
+                                            name = filesystem.type,
+                                            fileName = filesystem.fileName,
+                                            address = filesystem.address,
+                                            sizeBytes = filesystem.sizeBytes,
+                                            sha256 = filesystem.sha256,
+                                            downloadUrl = filesystem.downloadUrl,
+                                        ),
+                                    )
+                                },
+                            ) { Text("選択") }
+                        }
+                    }
+                }
+            }
             if (manifest.hasWiringGuide) {
                 TextButton(onClick = onOpenPinGuide) {
                     Icon(Icons.Filled.Memory, contentDescription = null)
@@ -420,15 +469,37 @@ private fun LocalFileCard(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AssistChip(
-                onClick = { onUsePreset(AddressPreset.MERGED) },
-                label = { Text("0x0000 結合済み") },
-            )
-            AssistChip(
-                onClick = { onUsePreset(AddressPreset.APP) },
-                label = { Text("0x10000 アプリ単体") },
-            )
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.MERGED) },
+                    label = { Text("0x0000 結合済み") },
+                )
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.APP) },
+                    label = { Text("0x10000 アプリ単体") },
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.PARTITION_TABLE) },
+                    label = { Text("0x8000 パーティション") },
+                )
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.OTA_DATA) },
+                    label = { Text("0xE000 OTADATA") },
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.LITTLEFS_DEFAULT) },
+                    label = { Text("0x290000 LittleFS (4MB)") },
+                )
+                AssistChip(
+                    onClick = { onUsePreset(AddressPreset.LITTLEFS_MIN_SPIFFS) },
+                    label = { Text("0x3D0000 LittleFS (min_spiffs)") },
+                )
+            }
         }
     }
 }

@@ -186,6 +186,8 @@ fun stageLabel(stage: FlashStage?): String = when (stage) {
     FlashStage.WRITING -> "書き込み中"
     FlashStage.FINISHING -> "書き込みを完了中"
     FlashStage.RESETTING -> "リセット中"
+    FlashStage.UPLOADING_STUB -> "スタブを転送中"
+    FlashStage.READING -> "読み出し中"
     FlashStage.DONE -> "書き込み完了"
     null -> "待機中"
 }
