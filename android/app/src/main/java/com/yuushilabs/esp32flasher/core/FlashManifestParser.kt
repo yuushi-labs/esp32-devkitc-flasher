@@ -225,7 +225,16 @@ object FlashManifestParser {
                 }
             val fileName = entry.str(*FILE_KEYS, "asset")?.takeIf { it.isNotBlank() }
                 ?: return@mapNotNull null
-            val address = entry.num(*ADDRESS_KEYS) ?: defaultFilesystemOffset(type)
+            // A present but unreadable offset must not silently move the write to the default
+            // location; only a missing offset falls back.
+            val hasOffsetKey = ADDRESS_KEYS.any { entry.containsKey(it) }
+            val parsedOffset = entry.num(*ADDRESS_KEYS)
+            if (hasOffsetKey && parsedOffset == null) {
+                throw ManifestFormatException(
+                    "$fileName のオフセットを数値として読み取れません",
+                )
+            }
+            val address = parsedOffset ?: defaultFilesystemOffset(type)
             FilesystemImage(
                 type = type.lowercase(),
                 fileName = fileName,

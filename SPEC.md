@@ -83,7 +83,7 @@ android/
 - metadata ブロックは littlefs のコンパクションと同じ 1 コミット構成: リビジョン（LE 32bit）→ 各エントリのタグ（big-endian で前タグと XOR）→ ブロック末尾まで埋める CRC タグ（データ部 1022 バイトずつに分割）。
 - エントリは `NAME`（型 1=REG / 2=DIR）+ 続く `INLINESTRUCT`（256 バイト以下）/ `CTZSTRUCT`（head + size）/ `DIRSTRUCT`（pair）。名前は UTF-8 バイト順に並べる（littlefs と同じ比較）。
 - 1 ブロックに収まらないディレクトリは `HARDTAIL (0x601)` で複数の pair に分割し、2 つ目以降の pair の id は 0 から振り直す（littlefs の `lfs_dir_split` と同じ）。
-- 大きいファイルは CTZ skip-list（`block_size - 8` ストライド、`ctz(index)+1` 本のポインタ）で書き、先頭ブロックを head として `CTZSTRUCT` に格納。
+- 大きいファイルは CTZ skip-list（`block_size - 8` ストライド、`ctz(index)+1` 本のポインタ）で書き、リンクを末尾から先頭へたどるため **末尾のデータブロックを head** として `CTZSTRUCT`（head + size）に格納する。
 - CRC は littlefs の `lfs_crc`（多項式 `0x04c11db7` のリフレクテッド 16 エントリ表、初期値 `0xffffffff`）。
 
 ### 5.5.2 読み取り（`LittleFsReader`）

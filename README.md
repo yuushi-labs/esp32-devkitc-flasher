@@ -21,7 +21,7 @@ ESP32-DevKitC 向けの Android 専用 USB OTG ファームウェア書き込み
 - **LittleFS 対応（v0.2.0）**: 追加タブ「LittleFS」から 3 つのことができます
   - **スマホのフォルダ・ファイルから LittleFS v2 イメージを生成して書き込み**: `OpenDocumentTree`（フォルダ）/ `OpenDocument`（複数ファイル）で登録し、相対パス・サイズ・使用率バーを表示。パーティション容量を超える場合は書き込み前にエラー。生成した `.bin` は端末へ保存も可能
   - **ビルド済み `littlefs.bin` / `spiffs.bin` の書き込み**: `flash-manifest.json` の `filesystems`（`type` / `offset` / `size` / `asset` / `sha256`）を解析し、ファームウェアと一緒に、または単体で正しいオフセットへ書き込み
-  - **ESP32 からの読み出し・データ吸い出し**: パーティションテーブル（`0x8000`）を読んで MD5 を検証し、`littlefs` / `spiffs` パーティションを自動検出して中身を一覧表示。ファイルをタップするとテキストプレビュー、1 ファイル保存・ZIP 一括保存・`.bin` イメージ丸ごとの保存ができます
+  - **ESP32 からの読み出し・データ吸い出し**: パーティションテーブル（`0x8000`）を読んで MD5 を検証し、`littlefs` / `spiffs` パーティションを自動検出します。一覧表示・テキストプレビュー・1 ファイル保存・ZIP 一括保存は **LittleFS イメージのみ** が対象です（SPIFFS はパーティションとして検出・`.bin` 保存まではできますが、中身の解析には対応していません）
   - 生成も解析も **純 Kotlin 実装**（NDK 不要）。`littlefs-python` との相互運用テストで、生成したイメージが実物の littlefs でマウントできること、逆に littlefs が作ったイメージを 1 バイトも違わず読めることを検証しています
 - **シリアルモニター**: ボーレート切替、タイムスタンプ、送受信ログ、コマンド送信（LF/CRLF）、EN リセット
   - 狭い画面でも潰れないコンパクトなヘッダー、横スクロールの改行モード／クイックコマンドバー（`HELP` `PING` `INFO` `PINOUT` `LED ON/OFF/BLINK`）、ログ全文コピー、送信履歴チップ、IME に追従する入力欄
@@ -76,12 +76,17 @@ cd android
 ./gradlew assembleRelease     # 署名済み APK (app/build/outputs/apk/release/)
 ```
 
-LittleFS の相互運用テストは `littlefs-python` があると自動で実行されます（無い場合はスキップ）。
+LittleFS の相互運用テストは `littlefs-python` があると Gradle のテスト実行中に自動で走ります（無い場合はスキップ）。手元で同じ検証だけを流す場合は次の順序で実行してください。
 
 ```bash
 pip install littlefs-python
-python3 ../tools/littlefs_interop.py verify build/littlefs-interop/verify    # 生成したイメージを littlefs-python でマウント
-python3 ../tools/littlefs_interop.py fixtures build/littlefs-interop/fixtures # littlefs-python 側で作ったイメージを読む
+cd android
+./gradlew testDebugUnitTest          # 参照イメージを app/build/littlefs-interop/ に書き出し、双方向の検証も行う
+
+# 生成したイメージ（LittleFsImageBuilder）を littlefs-python でマウントして照合
+python3 ../tools/littlefs_interop.py verify app/build/littlefs-interop/verify
+# littlefs-python 側でイメージを作るだけ（Kotlin 側の読み取り検証は Gradle テストが行う）
+python3 ../tools/littlefs_interop.py fixtures app/build/littlefs-interop/fixtures
 ```
 
 `local.properties` に `sdk.dir` を設定してください（`.gitignore` 済み）。

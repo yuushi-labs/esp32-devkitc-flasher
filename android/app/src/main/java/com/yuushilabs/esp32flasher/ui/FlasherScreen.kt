@@ -328,8 +328,9 @@ private fun FirmwareCard(
             if (manifest.filesystems.isNotEmpty()) {
                 Text("データ用イメージ (LittleFS / SPIFFS)", style = MaterialTheme.typography.labelLarge)
                 manifest.filesystems.forEach { filesystem ->
-                    val selected = (state.selection as? FirmwareSelection.ReleaseImage)
-                        ?.image?.fileName == filesystem.fileName
+                    val chosen = (state.selection as? FirmwareSelection.ReleaseImage)?.image
+                    val selected = chosen?.fileName == filesystem.fileName &&
+                        chosen.address == filesystem.address
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,

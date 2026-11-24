@@ -146,7 +146,7 @@ internal object LittleFsFormat {
     // ---- little-endian helpers ----
 
     fun readUInt32(image: ByteArray, offset: Int): Long {
-        if (offset < 0 || offset + 4 > image.size) {
+        if (offset < 0 || offset > image.size - 4) {
             throw LittleFsFormatException("littlefs イメージの範囲外を読み取ろうとしました (offset=$offset)")
         }
         var value = 0L
@@ -163,7 +163,7 @@ internal object LittleFsFormat {
     }
 
     fun readUInt32BigEndian(image: ByteArray, offset: Int): Long {
-        if (offset < 0 || offset + 4 > image.size) {
+        if (offset < 0 || offset > image.size - 4) {
             throw LittleFsFormatException("littlefs イメージの範囲外を読み取ろうとしました (offset=$offset)")
         }
         var value = 0L

@@ -159,6 +159,8 @@ class EspFlasherEngineReadTest {
                     if (!stubStarted) {
                         respond(op, status = 1, errorCode = 1)
                     } else {
+                        // The stub confirms the command, then streams the data frames.
+                        respond(op)
                         readActive = true
                         sendReadFrame()
                     }

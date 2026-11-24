@@ -98,8 +98,14 @@ object EspBootloaderProtocol {
     /** Block size esptool uses when copying the stub flasher into RAM. */
     const val RAM_BLOCK_SIZE = 0x1800
 
-    /** Payload size the stub flasher sends per read frame. */
+    /** Payload size the stub flasher sends per read frame (esptool's `FLASH_SECTOR_SIZE`). */
     const val READ_BLOCK_SIZE = 0x1000
+
+    /**
+     * How many packets the stub may send before an acknowledgement. esptool sends 64 here; the
+     * stub (esp-flasher-stub v1.4.1) waits for an ack after every packet regardless.
+     */
+    const val READ_UNCONFIRMED_PACKETS = 64
     const val PAGE_SIZE = 0x100
     const val DEFAULT_STATUS_MASK = 0xFFFF
     const val COMPRESSION_LEVEL = 9
@@ -192,7 +198,14 @@ object EspBootloaderProtocol {
 
     fun syncFrame(): ByteArray = requestFrame(EspCommands.SYNC, syncPayload())
 
-    fun spiAttachFrame(): ByteArray = requestFrame(EspCommands.SPI_ATTACH, uint32(0) + uint32(0))
+    /**
+     * `SPI_ATTACH` (0x0D). The ROM accepts a word describing the SPI pins (0 = the default flash
+     * wiring); the stub only reads the first word and works with the short form esptool sends.
+     */
+    fun spiAttachFrame(payloadBytes: Int = 8): ByteArray = requestFrame(
+        EspCommands.SPI_ATTACH,
+        if (payloadBytes >= 8) uint32(0) + uint32(0) else uint32(0),
+    )
 
     fun spiSetParamsFrame(
         totalSize: Int = 0x400000,
@@ -245,11 +258,11 @@ object EspBootloaderProtocol {
     fun readFlashFrame(
         offset: Long,
         size: Int,
-        sectorSize: Int = SECTOR_SIZE,
-        blockSize: Int = READ_BLOCK_SIZE,
+        packetSize: Int = READ_BLOCK_SIZE,
+        maxUnconfirmedPackets: Int = READ_UNCONFIRMED_PACKETS,
     ): ByteArray = requestFrame(
         EspCommands.READ_FLASH,
-        uint32(offset) + uint32(size) + uint32(sectorSize) + uint32(blockSize),
+        uint32(offset) + uint32(size) + uint32(packetSize) + uint32(maxUnconfirmedPackets),
     )
 
     /** `READ_FLASH_SLOW` (0x0E) — the ESP32 ROM reads at most 64 bytes per command. */

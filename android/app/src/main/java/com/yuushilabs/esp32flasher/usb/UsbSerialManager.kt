@@ -151,7 +151,12 @@ class UsbSerialManager(private val context: Context) {
         }
     }
 
+    /**
+     * Closes the port. Refused while a flash / read holds the port exclusively: closing it in the
+     * middle of a transfer would abort an erase or a read half way through.
+     */
     fun close() {
+        if (exclusiveAccess) return
         stopMonitoring()
         transport?.close()
         transport = null

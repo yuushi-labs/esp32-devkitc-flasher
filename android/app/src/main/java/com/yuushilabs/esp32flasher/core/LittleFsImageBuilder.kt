@@ -137,6 +137,15 @@ object LittleFsImageBuilder {
         inlineMax: Int,
     ): Layout {
         require(blockSize >= 128 && blockSize % 16 == 0) { "ブロックサイズが不正です: $blockSize" }
+        // A tag stores its payload length in 10 bits and 0x3ff means "deleted", so 1022 is the
+        // largest name or inline payload a single tag can describe.
+        require(nameMax in 1..LittleFsFormat.CRC_MAX_DATA) {
+            "nameMax は 1〜${LittleFsFormat.CRC_MAX_DATA} の範囲で指定してください: $nameMax"
+        }
+        require(inlineMax in 0..LittleFsFormat.CRC_MAX_DATA) {
+            "inlineMax は 0〜${LittleFsFormat.CRC_MAX_DATA} の範囲で指定してください: $inlineMax"
+        }
+        require(inlineMax < blockSize) { "inlineMax はブロックサイズより小さくしてください" }
         require(partitionSize >= blockSize * 2) {
             "パーティションサイズが小さすぎます (最低 ${blockSize * 2} バイト)"
         }
@@ -155,6 +164,9 @@ object LittleFsImageBuilder {
             val segments = path.split('/')
             var node = root
             for (segment in segments.dropLast(1)) {
+                if (node.files.containsKey(segment)) {
+                    throw LittleFsBuildException("ファイルとフォルダが同じ名前です: $path")
+                }
                 node = node.dirs.getOrPut(segment) { DirNode(segment) }
             }
             val name = segments.last()
@@ -210,14 +222,21 @@ object LittleFsImageBuilder {
                 }
             }
         }
+        // Planning only needs the block count; the block numbers are handed out while rendering so
+        // a file far larger than the partition cannot allocate millions of entries here.
         val ctzBlocks = LinkedHashMap<FileContent, List<Int>>()
         var dataBlocks = 0
+        val rendering = sources.any { it.data != null }
         for (dir in dirs) {
             for (entry in encoded.getValue(dir)) {
                 val file = entry.file ?: continue
                 if (file.size <= inlineMax) continue
                 val count = LittleFsFormat.ctzBlockCount(file.size, blockSize)
-                ctzBlocks[file] = List(count) { nextBlock++ }
+                if (rendering) {
+                    ctzBlocks[file] = List(count) { nextBlock++ }
+                } else {
+                    nextBlock += count
+                }
                 dataBlocks += count
             }
         }
@@ -352,36 +371,47 @@ object LittleFsImageBuilder {
                 }
             }
 
+            // Every metadata pair is also linked into the filesystem-wide thread (the tail tag),
+            // which littlefs walks to find the blocks in use. Pairs of one directory continue with
+            // HARDTAIL, the last pair of a directory continues into the next directory with
+            // SOFTTAIL, so a later write on the ESP32 cannot hand out blocks that are still in use.
+            val order = ArrayList<Pair<DirNode, Int>>()
             for (dir in dirs) {
-                val dirChunks = chunks.getValue(dir)
+                for (index in chunks.getValue(dir).indices) order += dir to index
+            }
+
+            for ((position, slot) in order.withIndex()) {
+                val dir = slot.first
+                val index = slot.second
                 val dirPairs = pairs.getValue(dir)
-                for ((index, chunk) in dirChunks.withIndex()) {
-                    val resolved = ArrayList<Encoder.ResolvedEntry>()
-                    var nextId = 0
-                    if (dir === root && index == 0) {
-                        resolved += Encoder.ResolvedEntry(
-                            tag = LittleFsFormat.makeTag(
-                                LittleFsFormat.TYPE_SUPERBLOCK,
-                                0,
-                                LittleFsFormat.MAGIC.length,
-                            ),
-                            data = LittleFsFormat.MAGIC.toByteArray(Charsets.US_ASCII),
-                            structTag = LittleFsFormat.makeTag(
-                                LittleFsFormat.TYPE_INLINESTRUCT,
-                                0,
-                                LittleFsFormat.SUPERBLOCK_SIZE,
-                            ),
-                            structData = superblockBytes(),
-                        )
-                        nextId = 1
-                    }
-                    for (entry in chunk) {
-                        resolved += resolve(entry, nextId)
-                        nextId++
-                    }
-                    val tail = if (index + 1 < dirChunks.size) dirPairs[index + 1] else null
-                    writer.writeMetadataBlock(dirPairs[index].head, resolved, tail)
+                val chunk = chunks.getValue(dir)[index]
+                val resolved = ArrayList<Encoder.ResolvedEntry>()
+                var nextId = 0
+                if (dir === root && index == 0) {
+                    resolved += Encoder.ResolvedEntry(
+                        tag = LittleFsFormat.makeTag(
+                            LittleFsFormat.TYPE_SUPERBLOCK,
+                            0,
+                            LittleFsFormat.MAGIC.length,
+                        ),
+                        data = LittleFsFormat.MAGIC.toByteArray(Charsets.US_ASCII),
+                        structTag = LittleFsFormat.makeTag(
+                            LittleFsFormat.TYPE_INLINESTRUCT,
+                            0,
+                            LittleFsFormat.SUPERBLOCK_SIZE,
+                        ),
+                        structData = superblockBytes(),
+                    )
+                    nextId = 1
                 }
+                for (entry in chunk) {
+                    resolved += resolve(entry, nextId)
+                    nextId++
+                }
+                val next = order.getOrNull(position + 1)
+                val tail = next?.let { pairs.getValue(it.first)[it.second] }
+                val hardTail = next != null && next.first === dir
+                writer.writeMetadataBlock(dirPairs[index].head, resolved, tail, hardTail)
             }
             return image
         }
@@ -465,7 +495,12 @@ object LittleFsImageBuilder {
             val structData: ByteArray? = null,
         )
 
-        fun writeMetadataBlock(block: Int, entries: List<ResolvedEntry>, tail: BlockPair?) {
+        fun writeMetadataBlock(
+            block: Int,
+            entries: List<ResolvedEntry>,
+            tail: BlockPair?,
+            hardTail: Boolean,
+        ) {
             requireBlock(block)
             val base = block * blockSize
             image.fill(0xFF.toByte(), base, base + blockSize)
@@ -496,8 +531,9 @@ object LittleFsImageBuilder {
                 }
             }
             if (tail != null) {
+                val type = if (hardTail) LittleFsFormat.TYPE_HARDTAIL else LittleFsFormat.TYPE_SOFTTAIL
                 writeTag(
-                    LittleFsFormat.makeTag(LittleFsFormat.TYPE_HARDTAIL, LittleFsFormat.ID_GLOBAL, 8),
+                    LittleFsFormat.makeTag(type, LittleFsFormat.ID_GLOBAL, 8),
                     pairBytes(tail.head, tail.spare),
                 )
             }
@@ -506,7 +542,11 @@ object LittleFsImageBuilder {
                 if (remaining < CRC_TAG_BYTES) {
                     throw LittleFsBuildException("メタデータブロックの CRC 用の空きがありません")
                 }
-                val dataSize = (remaining - 4).coerceAtMost(LittleFsFormat.CRC_MAX_DATA)
+                var dataSize = (remaining - 4).coerceAtMost(LittleFsFormat.CRC_MAX_DATA)
+                // Leave room for a complete next CRC tag (tag word + crc word) instead of a stub.
+                if (remaining - 4 > dataSize && remaining - 4 - dataSize < CRC_TAG_BYTES) {
+                    dataSize = remaining - 4 - CRC_TAG_BYTES
+                }
                 val tag = LittleFsFormat.makeTag(
                     LittleFsFormat.TYPE_CRC,
                     LittleFsFormat.ID_GLOBAL,

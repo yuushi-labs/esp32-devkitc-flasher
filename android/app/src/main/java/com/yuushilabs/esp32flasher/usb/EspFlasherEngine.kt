@@ -237,23 +237,30 @@ class EspFlasherEngine(
         }
         // MEM_END starts the stub; the ROM's own reply may be cut off by the switch, so the
         // greeting is what actually confirms the stub is running.
-        runCatching {
-            link.write(
-                EspBootloaderProtocol.memEndFrame(stub.entry),
-            )
-            val deadline = clock() + STUB_GREETING_TIMEOUT_MS * NANOS_PER_MILLI
-            while (clock() < deadline) {
-                checkCancelled()
-                val frame = runCatching { readRawFrame(MAX_READ_TIMEOUT_MS.toInt()) }.getOrNull()
-                    ?: continue
-                if (frame.contentEquals(STUB_GREETING)) {
-                    stubRunning = true
-                    listener.onLog("スタブフラッシャーが起動しました")
-                    return true
-                }
+        link.write(EspBootloaderProtocol.memEndFrame(stub.entry))
+        val deadline = clock() + STUB_GREETING_TIMEOUT_MS * NANOS_PER_MILLI
+        while (clock() < deadline) {
+            checkCancelled()
+            val frame = runCatching { readRawFrame(MAX_READ_TIMEOUT_MS.toInt()) }.getOrNull()
+                ?: continue
+            if (frame.contentEquals(STUB_GREETING)) {
+                stubRunning = true
+                listener.onLog("スタブフラッシャーが起動しました")
+                return true
             }
         }
         listener.onLog("スタブフラッシャーの起動を確認できませんでした")
+        // After MEM_END the chip state is unknown: it may be running a half copied stub. Only a ROM
+        // that answers a register read may receive further commands.
+        if (!isBootloaderReachableAt(link.baudRate)) {
+            if (!config.autoReset) {
+                throw EspProtocolException(
+                    "スタブの起動を確認できません。ESP32 をリセット (EN) してから再試行してください",
+                )
+            }
+            listener.onLog("ESP32 をリセットして ROM に戻します")
+            recoverAtSyncRate(link.baudRate)
+        }
         return false
     }
 
@@ -266,12 +273,18 @@ class EspFlasherEngine(
      */
     fun readFlash(offset: Long, size: Int, stub: EspStub? = null): ByteArray {
         require(size > 0) { "読み出すサイズは 1 バイト以上である必要があります" }
-        if (offset < 0) throw EspProtocolException("読み出し位置が不正です: $offset")
+        if (offset < 0 || offset + size > FLASH_ADDRESS_SPACE) {
+            throw EspProtocolException(
+                "読み出し範囲が 32 ビットのフラッシュ空間を超えています: " +
+                    "0x%X + %d".format(offset, size),
+            )
+        }
         val startedAt = clock()
         if (!isSynced) connect()
         val useStub = when {
             stubRunning -> true
             stub != null -> runCatching { uploadStub(stub) }.getOrElse { error ->
+                if (error is FlashCancelledException) throw error
                 listener.onLog("スタブの書き込みに失敗しました: ${error.message}")
                 // A half-finished RAM upload leaves the ROM in download mode, so bring it back to
                 // a known state before the slow read is attempted.
@@ -284,7 +297,7 @@ class EspFlasherEngine(
             else -> false
         }
         if (useStub) {
-            attachFlash()
+            attachFlash(stubMode = true)
             val out = ByteArray(size)
             var done = 0
             listener.onStage(FlashStage.READING)
@@ -304,7 +317,13 @@ class EspFlasherEngine(
     }
 
     private fun readFlashChunk(offset: Long, size: Int): ByteArray {
-        link.write(EspBootloaderProtocol.readFlashFrame(offset, size))
+        // The stub answers READ_FLASH with a normal status frame before the data frames start.
+        val response = commandFrame(
+            EspCommands.READ_FLASH,
+            EspBootloaderProtocol.readFlashFrame(offset, size),
+            config.responseTimeoutMs,
+        )
+        requireOk(EspCommands.READ_FLASH, response)
         val out = ByteArray(size)
         var received = 0
         while (received < size) {
@@ -349,15 +368,17 @@ class EspFlasherEngine(
                 EspBootloaderProtocol.readFlashSlowFrame(offset + received, block),
                 config.responseTimeoutMs,
             )
-            if (response.data.size < block) {
+            // The ROM always returns the full 64 byte block, then its status bytes.
+            if (response.data.size < READ_SLOW_BLOCK) {
                 throw EspProtocolException(
-                    "読み出し応答が短すぎます (${response.data.size} バイト / 必要 $block バイト)",
+                    "読み出し応答が短すぎます (${response.data.size} バイト / 必要 $READ_SLOW_BLOCK バイト)",
                 )
             }
-            // The ROM appends its status bytes right after the data.
-            if (response.data.size > block && response.data[block].toInt() != 0) {
+            if (response.data.size > READ_SLOW_BLOCK &&
+                response.data[READ_SLOW_BLOCK].toInt() != 0
+            ) {
                 throw EspProtocolException(
-                    "読み出しが拒否されました (status=${response.data[block].toInt() and 0xFF})",
+                    "読み出しが拒否されました (status=${response.data[READ_SLOW_BLOCK].toInt() and 0xFF})",
                 )
             }
             response.data.copyInto(out, received, 0, block)
@@ -388,6 +409,8 @@ class EspFlasherEngine(
     }
 
     fun hardReset() {
+        // A reset wipes the RAM, so the stub has to be uploaded again for the next read.
+        stubRunning = false
         listener.onStage(FlashStage.RESETTING)
         listener.onLog("ハードリセットを実行します")
         link.setDtrRts(false, true)
@@ -506,6 +529,7 @@ class EspFlasherEngine(
     }
 
     fun performBootloaderReset() {
+        stubRunning = false
         listener.onLog("DTR/RTS でブートローダーへ突入します")
         // esptool classic reset: EN low while IO0 stays high, then IO0 low while EN goes high.
         link.setDtrRts(false, true)
@@ -606,11 +630,11 @@ class EspFlasherEngine(
         return ChipInfo(name, mac)
     }
 
-    private fun attachFlash() {
+    private fun attachFlash(stubMode: Boolean = false) {
         listener.onStage(FlashStage.ATTACHING)
         val response = commandFrame(
             EspCommands.SPI_ATTACH,
-            EspBootloaderProtocol.spiAttachFrame(),
+            EspBootloaderProtocol.spiAttachFrame(if (stubMode) 4 else 8),
             config.responseTimeoutMs,
         )
         requireOk(EspCommands.SPI_ATTACH, response)
@@ -823,6 +847,9 @@ class EspFlasherEngine(
         const val READ_SLOW_BLOCK = 64
 
         const val DEFAULT_FLASH_SIZE = 0x400000
+
+        /** Addressable SPI flash window of the ESP32 (4 GiB). */
+        const val FLASH_ADDRESS_SPACE = 0x1_0000_0000L
 
         private val STUB_GREETING = "OHAI".toByteArray(Charsets.US_ASCII)
     }

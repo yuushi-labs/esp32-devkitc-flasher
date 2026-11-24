@@ -203,8 +203,21 @@ private fun LittleFsConnectionCard(state: LittleFsUiState, flasherViewModel: Fla
             }
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = flasherViewModel::disconnect) { Text("切断") }
-                OutlinedButton(onClick = flasherViewModel::pulseReset) { Text("リセット (EN)") }
+                OutlinedButton(
+                    onClick = flasherViewModel::disconnect,
+                    enabled = !state.busy && !state.readingDevice,
+                ) { Text("切断") }
+                OutlinedButton(
+                    onClick = flasherViewModel::pulseReset,
+                    enabled = !state.busy && !state.readingDevice,
+                ) { Text("リセット (EN)") }
+            }
+            if (state.busy || state.readingDevice) {
+                Text(
+                    "転送中は切断できません。完了するか中止してください。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
         state.chipInfo?.let { InfoRow("チップ", it.displayName) }
@@ -302,7 +315,7 @@ private fun PartitionRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { viewModel.applyDetectedPartition(entry) },
+            .clickable(enabled = entry.isFilesystem) { viewModel.applyDetectedPartition(entry) },
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -330,6 +343,10 @@ private fun PartitionRow(
         }
         if (selected) {
             Text("選択中", style = MaterialTheme.typography.labelSmall)
+        } else if (entry.isFilesystem) {
+            Text("タップで選択", style = MaterialTheme.typography.labelSmall)
+        } else {
+            Text("表示のみ", style = MaterialTheme.typography.labelSmall)
         }
     }
 }
@@ -480,7 +497,7 @@ private fun GenerateCard(
                 Spacer(Modifier.width(6.dp))
                 Text(if (state.busy) "処理中…" else "生成して書き込む")
             }
-            if (state.busy) {
+            if (state.busy && state.cancellable) {
                 OutlinedButton(onClick = onCancel) {
                     Icon(Icons.Filled.Stop, contentDescription = null)
                     Spacer(Modifier.width(4.dp))

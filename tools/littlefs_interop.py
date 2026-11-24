@@ -74,6 +74,9 @@ def walk(fs, prefix=""):
 def verify(directory):
     manifest_path = os.path.join(directory, "manifest.tsv")
     scenarios = read_manifest(manifest_path)
+    if not scenarios:
+        print(f"no scenarios in {manifest_path}")
+        return 1
     failures = 0
     for scenario in scenarios:
         name = scenario["name"]
@@ -136,6 +139,32 @@ def make_fixtures(directory):
         ],
         "py_big": [("big.bin", bytes((index * 7) % 256 for index in range(20000)))],
     }
+    # The churn image goes through create / delete / grow, so its metadata log has several
+    # commits with splice tags and an inline file that became a CTZ file.
+    churn = LittleFS(block_size=BLOCK_SIZE, block_count=32)
+    with churn.open("/a.txt", "w") as handle:
+        handle.write("a" * 10)
+    with churn.open("/b.txt", "w") as handle:
+        handle.write("b" * 20)
+    with churn.open("/c.txt", "w") as handle:
+        handle.write("c" * 30)
+    churn.remove("/b.txt")
+    with churn.open("/d.bin", "wb") as handle:
+        handle.write(bytes(5000))
+    with churn.open("/a.txt", "a") as handle:
+        handle.write("x" * 3000)
+    churn_image = bytes(churn.context.buffer)
+    churn_path = os.path.join(directory, "py_churn.bin")
+    with open(churn_path, "wb") as handle:
+        handle.write(churn_image)
+    manifest.append(f"py_churn\t{os.path.abspath(churn_path)}")
+    churn_files = {}
+    for name in sorted(churn.listdir("/")):
+        with churn.open("/" + name, "rb") as handle:
+            churn_files[name] = handle.read()
+        manifest.append(f"  {name}\t{sha256(churn_files[name])}")
+    print(f"[made] py_churn: {len(churn_files)} files, {len(churn_image)} bytes")
+
     for name, files in fixtures.items():
         block_count = 32
         fs = LittleFS(block_size=BLOCK_SIZE, block_count=block_count)
@@ -204,6 +233,45 @@ def make_test_resources(directory):
     return 0
 
 
+def append(directory):
+    """Mounts <directory>/image.bin read-write, adds a file, then prints every file's sha256.
+
+    This checks block reuse: after the reference allocator has written into an image the app
+    produced, every file that was there before must still read back unchanged.
+    """
+    image_path = os.path.join(directory, "image.bin")
+    with open(image_path, "rb") as handle:
+        data = bytearray(handle.read())
+    block_count = len(data) // BLOCK_SIZE
+
+    def mount():
+        fs = LittleFS(
+            UserContext(buffer=data),
+            mount=False,
+            block_size=BLOCK_SIZE,
+            block_count=block_count,
+        )
+        fs.mount()
+        return fs
+
+    fs = mount()
+    payload = bytes((index * 11) % 256 for index in range(6000))
+    with fs.open("/added-by-littlefs.bin", "wb") as handle:
+        handle.write(payload)
+    fs.unmount()
+    with open(image_path, "wb") as handle:
+        handle.write(data)
+
+    print(f"added\t{sha256(payload)}")
+    fs = mount()
+    for path, size in walk(fs):
+        if size is None:
+            continue
+        with fs.open("/" + path, "rb") as handle:
+            print(f"{path}\t{size}\t{sha256(handle.read())}")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -216,6 +284,8 @@ def main(argv):
         return make_fixtures(directory)
     if command == "testresources":
         return make_test_resources(directory)
+    if command == "append":
+        return append(directory)
     print(f"unknown command: {command}")
     return 2
 

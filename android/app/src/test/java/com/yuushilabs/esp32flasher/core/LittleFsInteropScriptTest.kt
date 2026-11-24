@@ -41,21 +41,44 @@ class LittleFsInteropScriptTest {
                 val process = ProcessBuilder(candidate, "-c", "import littlefs, sys; sys.exit(0)")
                     .redirectErrorStream(true)
                     .start()
-                process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0
+                val finished = process.waitFor(60, TimeUnit.SECONDS)
+                if (!finished) {
+                    process.destroyForcibly()
+                    process.waitFor(10, TimeUnit.SECONDS)
+                    false
+                } else {
+                    process.inputStream.close()
+                    process.exitValue() == 0
+                }
             }.getOrDefault(false)
             if (ok) return candidate
         }
         return null
     }
 
+    /** Runs one command with a hard time limit; a hung child is killed and reported. */
     private fun run(vararg args: String): Pair<Int, String> {
         val python = python() ?: ""
         val process = ProcessBuilder(listOf(python) + args)
             .redirectErrorStream(true)
             .start()
-        val output = process.inputStream.bufferedReader().readText()
-        process.waitFor(180, TimeUnit.SECONDS)
-        return process.exitValue() to output
+        val output = StringBuilder()
+        val reader = Thread {
+            runCatching {
+                process.inputStream.bufferedReader().forEachLine { line -> output.append(line).append('\n') }
+            }
+        }
+        reader.isDaemon = true
+        reader.start()
+        val finished = process.waitFor(180, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            process.waitFor(10, TimeUnit.SECONDS)
+            reader.join(2_000)
+            return -1 to "コマンドがタイムアウトしました: " + args.joinToString(" ") + "\n" + output
+        }
+        reader.join(5_000)
+        return process.exitValue() to output.toString()
     }
 
     private fun sha256(bytes: ByteArray): String =
@@ -101,24 +124,76 @@ class LittleFsInteropScriptTest {
     @Test
     fun `this app reads the images littlefs-python writes`() {
         assumeTrue("python3 + littlefs-python がないためスキップします", python() != null)
-        val output = File("build/littlefs-interop/fixtures").apply { mkdirs() }
+        val output = File("build/littlefs-interop/fixtures")
+        output.deleteRecursively()
+        output.mkdirs()
 
         val (code, text) = run(script.absolutePath, "fixtures", output.absolutePath)
         assertEquals("littlefs-python がイメージを作れませんでした:\n$text", 0, code)
 
-        val images = output.listFiles { file -> file.name.endsWith(".bin") }.orEmpty().sortedBy { it.name }
-        assertTrue(text, images.isNotEmpty())
-
-        var checked = 0
-        for (file in images) {
-            val reader = runCatching { LittleFsReader(file.readBytes()) }.getOrNull() ?: continue
-            for (entry in reader.files()) {
-                val data = reader.read(entry)
-                assertEquals(entry.size, data.size.toLong())
-                checked++
+        val manifest = output.resolve("manifest.tsv")
+        assertTrue("manifest.tsv がありません", manifest.isFile)
+        val expected = LinkedHashMap<String, MutableMap<String, String>>()
+        var current: MutableMap<String, String>? = null
+        for (line in manifest.readLines()) {
+            if (line.isBlank()) continue
+            if (!line.startsWith("  ")) {
+                current = LinkedHashMap()
+                expected[line.substringBefore('\t')] = current
+            } else {
+                current?.put(line.trim().substringBefore('\t'), line.trim().substringAfter('\t'))
             }
         }
-        assertTrue("littlefs-python のイメージを1件も読めませんでした", checked > 0)
+        assertTrue("littlefs-python のシナリオがありません", expected.isNotEmpty())
+
+        for ((name, files) in expected) {
+            val image = output.resolve("$name.bin")
+            assertTrue("$name.bin がありません", image.isFile)
+            val reader = LittleFsReader(image.readBytes())
+            val listed = reader.files().associateBy { it.path }
+            assertEquals("$name のファイル一覧", files.keys, listed.keys)
+            for ((path, digest) in files) {
+                val data = reader.read(listed.getValue(path))
+                assertEquals("$name / $path のサイズ", listed.getValue(path).size, data.size.toLong())
+                assertEquals("$name / $path の内容", digest, sha256(data))
+            }
+        }
+    }
+
+    @Test
+    fun `littlefs-python can write into a generated image without losing files`() {
+        assumeTrue("python3 + littlefs-python がないためスキップします", python() != null)
+        val output = File("build/littlefs-interop/append")
+        output.deleteRecursively()
+        output.mkdirs()
+
+        val files = listOf(
+            LittleFsFile("top.txt", "top".toByteArray()),
+            LittleFsFile("docs/memo.txt", "memo".repeat(100).toByteArray()),
+            LittleFsFile("docs/sub/deep.txt", "deep".toByteArray()),
+            LittleFsFile("docs/sub/another.dat", ByteArray(300) { index -> (index % 251).toByte() }),
+            LittleFsFile("big.bin", ByteArray(9000) { index -> (index * 5 % 256).toByte() }),
+        )
+        val image = LittleFsImageBuilder.build(files, partitionSize = 256 * 1024)
+        output.resolve("image.bin").writeBytes(image)
+
+        val (code, text) = run(script.absolutePath, "append", output.absolutePath)
+        assertEquals("littlefs-python が書き込めませんでした:\n$text", 0, code)
+
+        val lines = text.lines().filter { it.isNotBlank() }
+        val added = lines.firstOrNull { it.startsWith("added\t") }
+            ?: throw AssertionError("追加ファイルの結果がありません:\n$text")
+        val parsed = lines.filter { it.contains('\t') && !it.startsWith("added\t") }
+            .associate { line ->
+                val parts = line.split('\t')
+                parts[0] to parts[2]
+            }
+        // Every file that was in the image is still readable, byte for byte.
+        for (file in files) {
+            val path = LittleFsFile.normalizePath(file.path)
+            assertEquals("$path が失われました: $text", sha256(file.data), parsed[path])
+        }
+        assertEquals(added.substringAfter('\t'), parsed["added-by-littlefs.bin"])
     }
 
     @Test

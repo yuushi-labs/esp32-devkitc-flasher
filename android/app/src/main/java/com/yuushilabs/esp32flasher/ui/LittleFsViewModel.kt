@@ -67,6 +67,7 @@ data class LittleFsUiState(
     val plan: LittleFsImagePlan? = null,
     val planError: String? = null,
     val busy: Boolean = false,
+    val cancellable: Boolean = false,
     val busyLabel: String? = null,
     val progress: Float = 0f,
     val speedKbps: Int = 0,
@@ -120,7 +121,12 @@ class LittleFsViewModel(
     private var cancelRequested = false
 
     private var stub: EspStub? = null
-    private var lastImage: ByteArray? = null
+
+    /** Image generated from the phone's files; only used for flashing. */
+    private var generatedImage: ByteArray? = null
+
+    /** Image read back from the ESP32 together with the listing that belongs to it. */
+    private var deviceImage: ByteArray? = null
 
     private val listener = object : FlashListener {
         override fun onStage(stage: FlashStage) {
@@ -234,21 +240,20 @@ class LittleFsViewModel(
 
     private fun merge(added: List<PickedFile>) {
         if (added.isEmpty()) return
-        _state.update { current ->
-            val existing = current.files.associateBy { it.path }
-            val merged = ArrayList(current.files)
-            var duplicates = 0
-            for (file in added) {
-                if (existing.containsKey(file.path)) {
-                    duplicates++
-                    continue
-                }
-                merged += file
+        val current = _state.value
+        val paths = current.files.mapTo(HashSet()) { it.path }
+        val merged = ArrayList(current.files)
+        var duplicates = 0
+        for (file in added) {
+            if (!paths.add(file.path)) {
+                duplicates++
+                continue
             }
-            if (duplicates > 0) {
-                appendLog("同名のファイル $duplicates 件は追加しませんでした", LogLevel.WARN)
-            }
-            current.copy(files = merged.sortedBy { it.path })
+            merged += file
+        }
+        _state.update { it.copy(files = merged.sortedBy { file -> file.path }) }
+        if (duplicates > 0) {
+            appendLog("同名のファイル $duplicates 件は追加しませんでした", LogLevel.WARN)
         }
         recomputePlan()
     }
@@ -302,10 +307,17 @@ class LittleFsViewModel(
 
     /** Builds the image from the current file list, then writes it to the chip. */
     fun generateAndFlash() {
-        startBusy {
+        startBusy(cancellable = true) {
             val current = _state.value
             val offset = current.offset ?: throw LittleFsBuildException("オフセットが不正です")
             val size = current.partitionSize ?: throw LittleFsBuildException("サイズが不正です")
+            val detected = current.partitionTable?.entries?.firstOrNull { it.offset == offset }
+            if (detected != null && !detected.isFilesystem) {
+                throw LittleFsBuildException(
+                    "${detected.label} (${detected.typeLabel}/${detected.subtypeLabel}) は " +
+                        "LittleFS の書き込み先にできません",
+                )
+            }
             val files = withContext(Dispatchers.IO) { readFiles(current.files) }
             val image = withContext(Dispatchers.Default) {
                 LittleFsImageBuilder.build(files, partitionSize = size)
@@ -314,14 +326,14 @@ class LittleFsViewModel(
                 "LittleFS イメージを生成しました: ${formatBytes(image.size.toLong())} / ${files.size} ファイル",
                 LogLevel.SUCCESS,
             )
-            lastImage = image
+            generatedImage = image
             flashImage(image, offset)
         }
     }
 
     /** Builds the image and hands it to the system file picker. */
     fun saveImage(target: Uri) {
-        startBusy {
+        startBusy(cancellable = false) {
             val current = _state.value
             val size = current.partitionSize ?: throw LittleFsBuildException("サイズが不正です")
             val files = withContext(Dispatchers.IO) { readFiles(current.files) }
@@ -339,15 +351,22 @@ class LittleFsViewModel(
 
     private suspend fun flashImage(image: ByteArray, offset: Long) {
         val link = container.usbManager.link ?: throw IOException("USB デバイスに接続してください")
+        if (offset % 4096L != 0L) {
+            throw LittleFsBuildException(
+                "書き込み位置は 4 KB 境界に合わせてください: ${HexAddressParser.format(offset)}",
+            )
+        }
         val settings = container.settingsRepository.settings.first()
         val config = FlashConfig(
             compression = settings?.compression ?: true,
             autoReset = settings?.autoReset ?: true,
             targetBaudRate = settings?.flashBaudRate ?: AppSettings.DEFAULT_FLASH_BAUD,
         )
-        val resumeMonitoring = container.usbManager.beginExclusiveAccess(
-            settings?.monitorBaudRate ?: AppSettings.DEFAULT_MONITOR_BAUD,
-        )
+        val resumeMonitoring = withContext(Dispatchers.IO) {
+            container.usbManager.beginExclusiveAccess(
+                settings?.monitorBaudRate ?: AppSettings.DEFAULT_MONITOR_BAUD,
+            )
+        }
         try {
             val engine = EspFlasherEngine(
                 link = link,
@@ -370,7 +389,7 @@ class LittleFsViewModel(
                 FlashOutcome.Cancelled -> postMessage("書き込みを中止しました")
             }
         } finally {
-            container.usbManager.endExclusiveAccess(resumeMonitoring)
+            withContext(Dispatchers.IO) { container.usbManager.endExclusiveAccess(resumeMonitoring) }
         }
     }
 
@@ -383,11 +402,15 @@ class LittleFsViewModel(
                 it.copy(
                     readingDevice = true,
                     busy = true,
+                    cancellable = true,
                     busyLabel = "ESP32 から読み出しています",
                     readProgress = 0f,
                     deviceFiles = emptyList(),
+                    deviceImageSize = 0,
                     partitionTable = null,
                     previewPath = null,
+                    previewText = null,
+                    previewBytes = null,
                 )
             }
             try {
@@ -398,9 +421,11 @@ class LittleFsViewModel(
                     autoReset = settings?.autoReset ?: true,
                     targetBaudRate = settings?.flashBaudRate ?: AppSettings.DEFAULT_FLASH_BAUD,
                 )
-                val resumeMonitoring = container.usbManager.beginExclusiveAccess(
-                    settings?.monitorBaudRate ?: AppSettings.DEFAULT_MONITOR_BAUD,
-                )
+                val resumeMonitoring = withContext(Dispatchers.IO) {
+                    container.usbManager.beginExclusiveAccess(
+                        settings?.monitorBaudRate ?: AppSettings.DEFAULT_MONITOR_BAUD,
+                    )
+                }
                 try {
                     val engine = EspFlasherEngine(
                         link = link,
@@ -416,12 +441,7 @@ class LittleFsViewModel(
                         )
                     }
                     val table = withContext(Dispatchers.Default) {
-                        runCatching {
-                            PartitionTableParser.parseTableImage(
-                                tableImage,
-                                flashSize = DEFAULT_FLASH_BYTES,
-                            )
-                        }.getOrNull()
+                        runCatching { PartitionTableParser.parseTableImage(tableImage) }.getOrNull()
                     }
                     _state.update { it.copy(partitionTable = table, chipInfo = engine.chipInfo) }
                     if (table == null) {
@@ -443,7 +463,8 @@ class LittleFsViewModel(
                     applyDetectedPartition(fs)
                     val size = fs.size.toInt()
                     val image = withContext(Dispatchers.IO) { engine.readFlash(fs.offset, size, loadStub()) }
-                    lastImage = image
+                    deviceImage = image
+                    _state.update { it.copy(deviceImageSize = image.size.toLong()) }
                     val reader = withContext(Dispatchers.Default) {
                         runCatching { LittleFsReader(image) }.getOrElse { error ->
                             if (fs.isSpiffs) {
@@ -466,18 +487,29 @@ class LittleFsViewModel(
                         LogLevel.SUCCESS,
                     )
                 } finally {
-                    container.usbManager.endExclusiveAccess(resumeMonitoring)
+                    withContext(Dispatchers.IO) {
+                        container.usbManager.endExclusiveAccess(resumeMonitoring)
+                    }
                 }
             } catch (error: Exception) {
                 appendLog("読み出しに失敗しました: ${error.message}", LogLevel.ERROR)
                 postMessage(error.message ?: "読み出しに失敗しました")
             } finally {
-                _state.update { it.copy(readingDevice = false, busy = false, busyLabel = null) }
+                _state.update {
+                    it.copy(readingDevice = false, busy = false, cancellable = false, busyLabel = null)
+                }
             }
         }
     }
 
     fun applyDetectedPartition(entry: PartitionEntry) {
+        if (!entry.isFilesystem) {
+            appendLog(
+                "${entry.label} は ${entry.typeLabel}/${entry.subtypeLabel} なので LittleFS の書き込み先にはできません",
+                LogLevel.WARN,
+            )
+            return
+        }
         _state.update {
             it.copy(
                 preset = LittleFsPartitionPreset.CUSTOM,
@@ -497,7 +529,7 @@ class LittleFsViewModel(
 
     fun preview(entry: LittleFsEntry) {
         if (entry.isDirectory) return
-        val image = lastImage ?: return
+        val image = deviceImage ?: return
         viewModelScope.launch {
             val result = withContext(Dispatchers.Default) {
                 runCatching {
@@ -510,6 +542,8 @@ class LittleFsViewModel(
                 }
             }
             result.onSuccess { (text, bytes, truncated) ->
+                // A new read may have replaced the image while this one was being parsed.
+                if (deviceImage !== image) return@launch
                 _state.update {
                     it.copy(
                         previewPath = entry.path,
@@ -531,7 +565,7 @@ class LittleFsViewModel(
     }
 
     fun saveDeviceFile(target: Uri) {
-        val image = lastImage
+        val image = deviceImage
         val path = _state.value.previewPath
         if (image == null || path == null) return
         viewModelScope.launch {
@@ -551,7 +585,7 @@ class LittleFsViewModel(
     }
 
     fun saveDeviceZip(target: Uri) {
-        val image = lastImage
+        val image = deviceImage
         if (image == null) return
         viewModelScope.launch {
             try {
@@ -562,6 +596,7 @@ class LittleFsViewModel(
                         getApplication<Application>().contentResolver.openOutputStream(target)?.use { out ->
                             ZipOutputStream(out).use { zip ->
                                 for (entry in files) {
+                                    if (!isSafeZipPath(entry.path)) continue
                                     zip.putNextEntry(ZipEntry(entry.path))
                                     zip.write(reader.read(entry))
                                     zip.closeEntry()
@@ -580,7 +615,7 @@ class LittleFsViewModel(
     }
 
     fun saveDeviceImage(target: Uri) {
-        val image = lastImage ?: return
+        val image = deviceImage ?: return
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -604,10 +639,13 @@ class LittleFsViewModel(
         _state.update { it.copy(message = null) }
     }
 
-    private fun startBusy(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) {
+    private fun startBusy(
+        cancellable: Boolean = false,
+        block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit,
+    ) {
         if (_state.value.busy) return
         cancelRequested = false
-        _state.update { it.copy(busy = true, progress = 0f, speedKbps = 0) }
+        _state.update { it.copy(busy = true, cancellable = cancellable, progress = 0f, speedKbps = 0) }
         viewModelScope.launch {
             try {
                 block()
@@ -624,7 +662,7 @@ class LittleFsViewModel(
                 appendLog("失敗しました: ${error.message}", LogLevel.ERROR)
                 postMessage(error.message ?: "失敗しました")
             } finally {
-                _state.update { it.copy(busy = false, busyLabel = null) }
+                _state.update { it.copy(busy = false, cancellable = false, busyLabel = null) }
             }
         }
     }
@@ -694,9 +732,20 @@ class LittleFsViewModel(
                 return cursor.getLong(index)
             }
         }
-        // Documents that do not report a size are read once to learn it.
+        // Documents that do not report a size are streamed through a fixed buffer; reading stops at
+        // the partition limit instead of pulling a huge file into memory.
         return runCatching {
-            resolver.openInputStream(uri)?.use { it.readBytes().size.toLong() }
+            resolver.openInputStream(uri)?.use { stream ->
+                val buffer = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = stream.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > MAX_PARTITION_BYTES) break
+                }
+                total
+            }
         }.getOrNull() ?: 0L
     }
 
@@ -705,7 +754,22 @@ class LittleFsViewModel(
         val rootId = DocumentsContract.getTreeDocumentId(treeUri)
         val rootName = queryName(DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId))
         val out = ArrayList<PickedFile>()
-        walkDocument(resolver, treeUri, rootId, if (rootName.isBlank()) "" else rootName, out, 0)
+        val skipped = ArrayList<String>()
+        walkDocument(
+            resolver,
+            treeUri,
+            rootId,
+            if (rootName.isBlank()) "" else rootName,
+            out,
+            skipped,
+            0,
+        )
+        if (skipped.isNotEmpty()) {
+            appendLog(
+                "深すぎるフォルダ ${skipped.size} 件は取り込んでいません: ${skipped.take(3).joinToString(", ")}",
+                LogLevel.WARN,
+            )
+        }
         return out
     }
 
@@ -715,9 +779,13 @@ class LittleFsViewModel(
         documentId: String,
         path: String,
         out: MutableList<PickedFile>,
+        skipped: MutableList<String>,
         depth: Int,
     ) {
-        if (depth > MAX_FOLDER_DEPTH) return
+        if (depth > MAX_FOLDER_DEPTH) {
+            skipped += path.ifEmpty { "/" }
+            return
+        }
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
         val children = ArrayList<Triple<String, String, Long>>() // id, name, size
         resolver.query(
@@ -743,7 +811,7 @@ class LittleFsViewModel(
         for ((id, name, size) in children.sortedBy { it.second }) {
             val childPath = if (path.isEmpty()) name else "$path/$name"
             if (size < 0) {
-                walkDocument(resolver, treeUri, id, childPath, out, depth + 1)
+                walkDocument(resolver, treeUri, id, childPath, out, skipped, depth + 1)
             } else {
                 val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
                 out += pickedFile(uri, childPath)
@@ -763,6 +831,13 @@ class LittleFsViewModel(
     }
 
     private fun formatBytes(bytes: Long): String = formatSize(bytes)
+
+    /** ZIP entry names must stay relative and inside the archive. */
+    private fun isSafeZipPath(path: String): Boolean =
+        path.isNotEmpty() &&
+            !path.startsWith("/") &&
+            !path.contains('\\') &&
+            path.split('/').none { it.isEmpty() || it == "." || it == ".." }
 
     private fun isProbablyText(bytes: ByteArray): Boolean {
         if (bytes.isEmpty()) return true

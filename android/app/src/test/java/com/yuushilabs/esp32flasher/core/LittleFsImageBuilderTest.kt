@@ -122,6 +122,59 @@ class LittleFsImageBuilderTest {
     }
 
     @Test
+    fun `a sub-directory that needs several metadata blocks is read completely`() {
+        val files = (0 until 120).map { index ->
+            LittleFsFile(
+                "photos/IMG-2026-11-24-%03d.png".format(index),
+                ByteArray(900 + index) { offset -> (offset * 3).toByte() },
+            )
+        }
+        val image = build(files, size = 1024 * 1024)
+        val reader = LittleFsReader(image)
+
+        assertEquals(1, reader.list().count { it.isDirectory })
+        val listed = reader.files()
+        assertEquals(120, listed.size)
+        for (file in files) {
+            assertArrayEquals(file.data, reader.read(file.normalizedPath))
+        }
+    }
+
+    @Test
+    fun `inline and ctz files sit on both sides of the threshold`() {
+        val inline = ByteArray(LittleFsImageBuilder.INLINE_MAX) { 1 }
+        val ctz = ByteArray(LittleFsImageBuilder.INLINE_MAX + 1) { 2 }
+        val image = build(
+            listOf(
+                LittleFsFile("exactly-inline.bin", inline),
+                LittleFsFile("just-over.bin", ctz),
+                LittleFsFile("zero.dat", ByteArray(0)),
+            ),
+        )
+        val reader = LittleFsReader(image)
+        assertArrayEquals(inline, reader.read("exactly-inline.bin"))
+        assertArrayEquals(ctz, reader.read("just-over.bin"))
+        assertEquals(0, reader.read("zero.dat").size)
+    }
+
+    @Test
+    fun `deeply nested folders keep their paths`() {
+        val image = build(
+            listOf(
+                LittleFsFile("a/b/c/d/e/f/g.txt", "deep".toByteArray()),
+                LittleFsFile("a/b/sibling.txt", "sib".toByteArray()),
+            ),
+        )
+        val reader = LittleFsReader(image)
+        assertEquals(
+            setOf("a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f"),
+            reader.list().filter { it.isDirectory }.map { it.path }.toSet(),
+        )
+        assertArrayEquals("deep".toByteArray(), reader.read("a/b/c/d/e/f/g.txt"))
+        assertArrayEquals("sib".toByteArray(), reader.read("a/b/sibling.txt"))
+    }
+
+    @Test
     fun `plan reports the blocks an image needs`() {
         val files = listOf(
             LittleFsPlannedFile("a.bin", 20000),

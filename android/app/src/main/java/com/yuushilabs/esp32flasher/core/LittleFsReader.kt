@@ -35,7 +35,9 @@ class LittleFsReader(private val image: ByteArray) {
 
     private data class TagRef(val offset: Int, val tag: Long) {
         val dataOffset: Int get() = offset + 4
-        val dataSize: Int get() = LittleFsFormat.size(tag)
+
+        /** Bytes that really follow the tag word: a delete marker (size 0x3ff) carries none. */
+        val dataSize: Int get() = LittleFsFormat.diskSize(tag) - 4
     }
 
     private data class ParsedBlock(
@@ -54,6 +56,27 @@ class LittleFsReader(private val image: ByteArray) {
         var ctzHead: Int = -1
         var ctzSize: Long = 0
         var dirPair: BlockPair? = null
+
+        // A later struct tag supersedes the earlier one, so switching between inline data and a CTZ
+        // skip-list has to clear the previous form.
+        fun applyInline(data: ByteArray) {
+            inline = data
+            ctzHead = -1
+            ctzSize = 0
+        }
+
+        fun applyCtz(head: Int, size: Long) {
+            inline = null
+            ctzHead = head
+            ctzSize = size
+        }
+
+        fun applyDirectory(pair: BlockPair) {
+            inline = null
+            ctzHead = -1
+            ctzSize = 0
+            dirPair = pair
+        }
     }
 
     val superblock: Superblock
@@ -64,29 +87,33 @@ class LittleFsReader(private val image: ByteArray) {
         if (image.size < 64) {
             throw LittleFsFormatException("イメージが小さすぎます (${image.size} バイト)")
         }
-        val magic = String(image, 8, LittleFsFormat.MAGIC.length, Charsets.US_ASCII)
-        if (magic != LittleFsFormat.MAGIC) {
-            throw LittleFsFormatException("littlefs のスーパーブロックが見つかりません")
-        }
-        val version = LittleFsFormat.readUInt32(image, 20)
-        val major = (version shr 16) and 0xFFFF
+        // The superblock lives in the metadata pair on blocks 0 and 1; either copy may be the one
+        // that survived, exactly like the reference implementation reads them.
+        val found = readSuperblockAt(0) ?: readSuperblockAt(superblockBlockSize())
+            ?: throw LittleFsFormatException("littlefs のスーパーブロックが見つかりません")
+        val major = (found.version shr 16) and 0xFFFF
         if (major != 2L) {
-            throw LittleFsFormatException("未対応の littlefs バージョンです: 0x%08X".format(version))
+            throw LittleFsFormatException(
+                "未対応の littlefs バージョンです: 0x%08X".format(found.version),
+            )
         }
-        val size = LittleFsFormat.readUInt32(image, 24).toInt()
-        if (size < 128 || size > image.size || image.size % size != 0) {
-            throw LittleFsFormatException("ブロックサイズが不正です: $size")
+        if (found.blockSize < 128 || found.blockSize > image.size ||
+            image.size % found.blockSize != 0
+        ) {
+            throw LittleFsFormatException("ブロックサイズが不正です: ${found.blockSize}")
         }
-        blockSize = size
-        superblock = Superblock(
-            version = version,
-            blockSize = size,
-            blockCount = LittleFsFormat.readUInt32(image, 28).toInt(),
-            nameMax = LittleFsFormat.readUInt32(image, 32),
-            fileMax = LittleFsFormat.readUInt32(image, 36),
-            attrMax = LittleFsFormat.readUInt32(image, 40),
-        )
+        blockSize = found.blockSize
+        superblock = found
         rootPair = locateRoot()
+    }
+
+    /** Block size candidate for the second copy: the LFS block size is a power of two. */
+    private fun superblockBlockSize(): Int {
+        var size = 0x10000
+        while (size > 128 && image.size % size != 0) {
+            size /= 2
+        }
+        return size
     }
 
     /** Walks the superblock metadata chain; the last pair that carries a superblock is the root. */
@@ -101,6 +128,7 @@ class LittleFsReader(private val image: ByteArray) {
             val tail = block.tail ?: break
             if (tail.head < 0 || tail.spare < 0) break
             if (tail.head >= superblock.blockCount || tail.spare >= superblock.blockCount) break
+            if (tail.head >= image.size / blockSize || tail.spare >= image.size / blockSize) break
             pair = tail
         }
         return root ?: throw LittleFsFormatException("littlefs のスーパーブロックをたどれませんでした")
@@ -154,7 +182,9 @@ class LittleFsReader(private val image: ByteArray) {
                 if (state.type == LittleFsFormat.TYPE_DIR) {
                     out += LittleFsEntry(path = path, name = name, isDirectory = true, size = 0)
                     val childPair = state.dirPair
-                    if (childPair != null) readDirectory(childPair, path, out, visited)
+                    if (childPair != null && childPair.head < image.size / blockSize) {
+                        readDirectory(childPair, path, out, visited)
+                    }
                 } else {
                     val size = when {
                         state.inline != null -> state.inline!!.size.toLong()
@@ -233,8 +263,10 @@ class LittleFsReader(private val image: ByteArray) {
                 }
 
                 LittleFsFormat.type3(tag) == LittleFsFormat.TYPE_DELETE -> {
-                    shift(id + 1, -1)
+                    // Remove the target before compacting the ids, or the entry that moves into its
+                    // slot would be deleted instead.
                     entries.remove(id)
+                    shift(id + 1, -1)
                     count = (count - 1).coerceAtLeast(0)
                 }
 
@@ -249,21 +281,26 @@ class LittleFsReader(private val image: ByteArray) {
                 LittleFsFormat.type1(tag) == TYPE1_STRUCT -> {
                     val state = stateFor(id)
                     when (LittleFsFormat.type3(tag)) {
-                        LittleFsFormat.TYPE_INLINESTRUCT -> state.inline = image.copyOfRange(
-                            ref.dataOffset,
-                            ref.dataOffset + ref.dataSize,
-                        )
+                        LittleFsFormat.TYPE_INLINESTRUCT -> {
+                            state.applyInline(
+                                image.copyOfRange(ref.dataOffset, ref.dataOffset + ref.dataSize),
+                            )
+                        }
 
                         LittleFsFormat.TYPE_DIRSTRUCT -> if (ref.dataSize >= 8) {
-                            state.dirPair = BlockPair(
-                                LittleFsFormat.readUInt32(image, ref.dataOffset).toInt(),
-                                LittleFsFormat.readUInt32(image, ref.dataOffset + 4).toInt(),
+                            state.applyDirectory(
+                                BlockPair(
+                                    LittleFsFormat.readUInt32(image, ref.dataOffset).toInt(),
+                                    LittleFsFormat.readUInt32(image, ref.dataOffset + 4).toInt(),
+                                ),
                             )
                         }
 
                         LittleFsFormat.TYPE_CTZSTRUCT -> if (ref.dataSize >= 8) {
-                            state.ctzHead = LittleFsFormat.readUInt32(image, ref.dataOffset).toInt()
-                            state.ctzSize = LittleFsFormat.readUInt32(image, ref.dataOffset + 4)
+                            state.applyCtz(
+                                LittleFsFormat.readUInt32(image, ref.dataOffset).toInt(),
+                                LittleFsFormat.readUInt32(image, ref.dataOffset + 4),
+                            )
                         }
                     }
                 }
@@ -272,8 +309,20 @@ class LittleFsReader(private val image: ByteArray) {
         return (0 until count).mapNotNull { entries[it] }
     }
 
+    /** Rejects a block number that cannot exist in this image before it is turned into an offset. */
+    private fun requireBlock(block: Int, what: String): Int {
+        val blocks = image.size / blockSize
+        if (block < 0 || block >= blocks) {
+            throw LittleFsFormatException("$what がイメージの外を指しています: block=$block")
+        }
+        return block
+    }
+
+    private fun blockBase(block: Int, what: String): Int = requireBlock(block, what) * blockSize
+
     /** Picks the newest copy of a metadata pair that holds at least one valid commit. */
     private fun readBlock(pair: BlockPair): ParsedBlock {
+        requireBlock(pair.head, "メタデータ")
         val candidates = listOf(pair.head, pair.spare)
             .mapNotNull { block -> runCatching { parseBlock(block) }.getOrNull() }
             .filter { it.valid }
@@ -284,7 +333,7 @@ class LittleFsReader(private val image: ByteArray) {
     }
 
     private fun parseBlock(block: Int): ParsedBlock? {
-        if (block < 0 || block * blockSize + blockSize > image.size) return null
+        if (block < 0 || block >= image.size / blockSize) return null
         val base = block * blockSize
         val revision = LittleFsFormat.readUInt32(image, base)
         if (revision == 0xFFFFFFFFL) return null
@@ -317,7 +366,12 @@ class LittleFsReader(private val image: ByteArray) {
                 continue
             }
 
-            crc = LittleFsFormat.crc(crc, image, offset + 4, offset + 4 + LittleFsFormat.size(tag))
+            crc = LittleFsFormat.crc(
+                crc,
+                image,
+                offset + 4,
+                offset + 4 + (LittleFsFormat.diskSize(tag) - 4),
+            )
             previous = tag and 0x7FFFFFFFL
             tags += TagRef(offset, tag)
         }
@@ -348,10 +402,13 @@ class LittleFsReader(private val image: ByteArray) {
     }
 
     private fun readSuperblockAt(base: Int): Superblock? {
+        if (base < 0 || base + 44 > image.size) return null
         val magic = runCatching {
             String(image, base + 8, LittleFsFormat.MAGIC.length, Charsets.US_ASCII)
         }.getOrNull() ?: return null
         if (magic != LittleFsFormat.MAGIC) return null
+        val blockSizeValue = LittleFsFormat.readUInt32(image, base + 24).toInt()
+        if (blockSizeValue < 128 || blockSizeValue > image.size) return null
         return Superblock(
             version = LittleFsFormat.readUInt32(image, base + 20),
             blockSize = LittleFsFormat.readUInt32(image, base + 24).toInt(),
@@ -364,7 +421,15 @@ class LittleFsReader(private val image: ByteArray) {
 
     private fun readCtz(head: Int, size: Long): ByteArray {
         if (size <= 0L) return ByteArray(0)
-        if (size > Int.MAX_VALUE) throw LittleFsFormatException("ファイルが大きすぎます: $size")
+        // The declared size must be something the image can actually hold, otherwise a corrupt
+        // entry would allocate an enormous array before any block check runs.
+        val capacity = image.size.toLong()
+        if (size > capacity || size > Int.MAX_VALUE) {
+            throw LittleFsFormatException(
+                "ファイルサイズが不正です: $size バイト (イメージ $capacity バイト)",
+            )
+        }
+        requireBlock(head, "CTZ の先頭")
         val out = ByteArray(size.toInt())
         var written = 0
         val lastIndex = LittleFsFormat.ctzIndex(size - 1, blockSize)
@@ -375,10 +440,7 @@ class LittleFsReader(private val image: ByteArray) {
             val length = minOf(capacity.toLong(), size - position).toInt()
             if (length <= 0) break
             val block = findCtzBlock(head, lastIndex, position)
-            val base = block * blockSize
-            if (base < 0 || base + blockSize > image.size) {
-                throw LittleFsFormatException("CTZ ブロックがイメージの外にあります: $block")
-            }
+            val base = blockBase(block, "CTZ ブロック")
             val from = base + LittleFsFormat.ctzDataOffset(index, blockSize)
             image.copyInto(out, written, from, from + length)
             written += length
@@ -397,14 +459,14 @@ class LittleFsReader(private val image: ByteArray) {
                 LittleFsFormat.npw2(current - target + 1) - 1,
                 Integer.numberOfTrailingZeros(current),
             )
-            val base = block * blockSize
-            if (base < 0 || base + 4 * skip + 4 > image.size) {
+            val base = blockBase(block, "CTZ のポインタ")
+            if (base + 4 * skip + 4 > image.size) {
                 throw LittleFsFormatException("CTZ のポインタがイメージの外にあります: $block")
             }
-            val next = LittleFsFormat.readUInt32(image, base + 4 * skip).toInt()
-            if (next < 0 || next >= image.size / blockSize) {
-                throw LittleFsFormatException("CTZ のリンクが壊れています: $next")
-            }
+            val next = requireBlock(
+                LittleFsFormat.readUInt32(image, base + 4 * skip).toInt(),
+                "CTZ のリンク",
+            )
             block = next
             current -= 1 shl skip
             guard++
@@ -419,8 +481,17 @@ class LittleFsReader(private val image: ByteArray) {
         private const val TYPE1_STRUCT = 2
         private const val TYPE1_TAIL = 6
 
-        fun isLittleFs(image: ByteArray): Boolean =
-            image.size >= 16 &&
-                String(image, 8, LittleFsFormat.MAGIC.length, Charsets.US_ASCII) == LittleFsFormat.MAGIC
+        fun isLittleFs(image: ByteArray): Boolean {
+            if (image.size < 64) return false
+            fun hasMagic(base: Int): Boolean =
+                base + 8 + LittleFsFormat.MAGIC.length <= image.size &&
+                    String(image, base + 8, LittleFsFormat.MAGIC.length, Charsets.US_ASCII) ==
+                    LittleFsFormat.MAGIC
+            if (hasMagic(0)) return true
+            // The second copy of the superblock pair can be the one that survived.
+            var candidate = 0x10000
+            while (candidate > 128 && image.size % candidate != 0) candidate /= 2
+            return hasMagic(candidate)
+        }
     }
 }
